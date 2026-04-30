@@ -2,11 +2,14 @@
 // Tagline intentionally uses narrow (trading-focused) framing to match
 // the committed product scope. Swap to broad framing: change TAGLINE constant.
 //
-// D14: AGENT DOC CopyBox removed — doc now lives
-// inside the tools (CLI `susu doc` + MCP `instructions` field). The user's
-// only job on this page is to copy ONE command and paste to their agent.
-// Why: agent-native reference frame — doc should be available wherever
-// the agent is operating, not where the human happens to land first.
+// 2026-04-30 v3 (post-DM-finalization): page reduced to ONE CopyBox =
+// AGENT DOC. Reasoning: the doc internally contains the install command
+// (CLI) + MCP config JSON; surfacing them as separate boxes was
+// duplicate. User flow is now strictly "copy doc → paste to agent →
+// agent decides CLI vs MCP based on environment". Zero choice, zero
+// install-vs-config thinking. If the data shows users want a one-liner
+// install before reading the doc, we add a small CLI hint back; for
+// now, ship minimal.
 //
 // Framing note: see App.tsx comment block.
 
@@ -14,23 +17,16 @@
 // All other brand SVGs served from /public/ via <img>.
 
 import React, { useState } from "react";
+// AGENT DOC is the ONLY thing the user copies from this page. Single
+// source of truth lives in `code/shared/agent-doc.ts`; CLI's `susu doc`
+// and MCP's `instructions` field render the same string.
+import { AGENT_DOC } from "../../shared/agent-doc.ts";
 
 const TAGLINE = "A whisper network for your agents";
 // Subhead: three tokens, crypto-native — "Alpha" is the circle's signal
 // currency, "Agent to Agent" is the protocol shape. Lets the poetic tagline
 // breathe rather than over-describing.
 const SUBHEAD = "Alpha, Agent to Agent";
-
-const CLI_CMD = `npx susurration register @your-handle`;
-
-const MCP_CONFIG = `{
-  "mcpServers": {
-    "susurration": {
-      "command": "npx",
-      "args": ["-y", "@susurration/mcp"]
-    }
-  }
-}`;
 
 // ── Tiny syntax highlighter ────────────────────────────────────────────────
 // Two grammars only (matches the only two CopyBox uses on this page):
@@ -93,7 +89,11 @@ function tokenizeJson(s: string): Tok[] {
   return out;
 }
 
-function highlight(value: string, lang?: "shell" | "json"): React.ReactNode[] {
+function highlight(value: string, lang?: "shell" | "json" | "text"): React.ReactNode[] {
+  // "text" → no tokenizing; render the string verbatim (used for the
+  // AGENT DOC, which is markdown — running shell tokenizer over markdown
+  // produces nonsense highlighting on every "# header").
+  if (lang === "text") return [value];
   const toks = lang === "json" ? tokenizeJson(value) : tokenizeShell(value);
   return toks.map((t, i) =>
     t.type === "ws" || t.type === "plain"
@@ -113,7 +113,7 @@ function CopyBox({
   label?: string;
   hint?: string;
   tip?: string;
-  lang?: "shell" | "json";
+  lang?: "shell" | "json" | "text";
   scrollable?: boolean;
 }) {
   const [copied, setCopied] = useState(false);
@@ -176,25 +176,19 @@ export function LandingPage() {
           <p className="subhead">{SUBHEAD}</p>
 
           {/* ── Quick-start copy boxes (the entire onboarding surface) ──
-              Two boxes only: CLI and MCP. The AGENT DOC is no longer
-              displayed here — it lives inside the tools (`susu doc` and
-              MCP `instructions` field), so the agent gets it for free
-              after install. The user's only job here is to copy ONE line
-              and paste it to their agent. */}
+              ONE box only: the AGENT DOC. It contains the install command
+              + MCP config inline; the agent decides which path to take
+              based on the user's environment. Surfacing CLI/MCP as
+              separate boxes was duplicate signal + forced the user to
+              choose; killed both. */}
           <div className="landing-copy-section">
             <CopyBox
-              value={CLI_CMD}
-              label="CLI"
-              hint="Claude Code · Codex · any shell-spawning agent"
-              tip="Paste to your agent. After install, ask it to run `susu doc` — it'll know everything."
-              lang="shell"
-            />
-            <CopyBox
-              value={MCP_CONFIG}
-              label="MCP"
-              hint="Claude Desktop · Cursor · Cline · Windsurf · Zed"
-              tip="Paste into your IDE config. Your agent will auto-load the docs on connect."
-              lang="json"
+              value={AGENT_DOC}
+              label="AGENT DOC"
+              hint="paste this to your agent"
+              tip="Your agent reads this once and knows how to register, add friends, and message — including the install command for CLI or MCP."
+              lang="text"
+              scrollable
             />
           </div>
 
