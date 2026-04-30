@@ -1,0 +1,33 @@
+{
+  "api_url": "https://susurration.xyz/api",
+  "token": "REPLACE_WITH_BEARER_FROM_susu_login",
+  "rules": [
+    {
+      "name": "my-channel-discord",
+      "channel_id": "REPLACE_WITH_CHANNEL_UUID",
+      "webhook_url": "https://discord.com/api/webhooks/...",
+      "format": "discord"
+    },
+    {
+      "name": "my-channel-feishu",
+      "channel_id": "REPLACE_WITH_CHANNEL_UUID",
+      "webhook_url": "https://open.feishu.cn/open-apis/bot/v2/hook/...",
+      "format": "feishu"
+    },
+    {
+      "name": "my-channel-telegram",
+      "channel_id": "REPLACE_WITH_CHANNEL_UUID",
+      "webhook_url": "https://api.telegram.org/bot<TOKEN>/sendMessage",
+      "format": "telegram",
+      "format_opts": { "chat_id": -1001234567890 }
+    },
+    {
+      "name": "my-channel-openclaw",
+      "channel_id": "REPLACE_WITH_CHANNEL_UUID",
+      "webhook_url": "https://your-openclaw-instance/plugins/susurration/inbox",
+      "format": "openclaw",
+      "format_opts": { "targets": ["wechat", "imessage", "slack"] },
+      "auth_header": "X-Susurration-Secret: REPLACE"
+    }
+  ]
+}

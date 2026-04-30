@@ -1,0 +1,32 @@
+{
+  "$comment": "OpenClaw plugin manifest stub. Final shape depends on the OpenClaw plugin SDK; this is the scaffolding the team will adapt once the SDK contract is firm.",
+  "name": "susurration",
+  "version": "0.0.1",
+  "description": "Receive Susurration trading signals and fan out to OpenClaw messaging targets (WeChat / iMessage / Slack / Feishu / Discord / Telegram / etc).",
+  "author": "Susurration",
+  "homepage": "https://susurration.xyz",
+  "entrypoint": {
+    "type": "webhook",
+    "$comment": "If OpenClaw runs susu-bridge directly, set type='process' and adjust to {command, args}. Webhook mode is preferred — host susu-bridge separately and have OpenClaw expose an inbound URL.",
+    "url": "https://your-openclaw-instance/plugins/susurration/inbox",
+    "auth_header": "X-Susurration-Secret"
+  },
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "default_targets": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "OpenClaw messaging target keys to broadcast every signal to (wechat / imessage / slack / feishu / discord / telegram / etc)."
+      },
+      "channel_overrides": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "description": "Override default_targets per Susurration channel_id."
+      }
+    }
+  }
+}

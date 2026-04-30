@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "susurration-codex"
+version = "0.0.1"
+description = "OpenAI Codex / Tools API integration for Susurration"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "susurration",
+]
+
+[project.scripts]
+susu-codex-tools = "susurration_codex.cli:print_tools_json"
+
+[tool.hatch.build]
+include = ["src/susurration_codex/**/*.py"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/susurration_codex"]

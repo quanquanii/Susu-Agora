@@ -1,0 +1,247 @@
+// Admin endpoints — analytics on `events` table. Bearer-token gated by
+// SUSU_ADMIN_TOKEN env. PII boundary: address_hash is hash(address+salt) so
+// admin can JOIN events by user but not reverse to address.
+//
+// Mount BEFORE the /api/* 404 catch-all in index.ts (otherwise catch-all
+// swallows admin routes since they're registered after).
+
+import { Hono } from "hono";
+import type { Context } from "hono";
+import { sql } from "../db.ts";
+import { config } from "../config.ts";
+import { parseJsonBody, invalidJson } from "../lib/http.ts";
+import { isValidSolanaAddress } from "../auth.ts";
+
+export const adminRoutes = new Hono();
+
+function adminGuard(c: Context): { ok: true } | { error: any } {
+  if (!config.adminToken) {
+    return { error: c.json({ error: "admin_disabled", reason: "SUSU_ADMIN_TOKEN not set" }, 503) };
+  }
+  const auth = c.req.header("authorization") ?? "";
+  const token = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length).trim() : "";
+  if (token !== config.adminToken) {
+    return { error: c.json({ error: "admin_unauthorized" }, 401) };
+  }
+  return { ok: true };
+}
+
+// GET /admin/events?since=ISO&until=ISO&type=&limit=
+adminRoutes.get("/admin/events", async (c) => {
+  const g = adminGuard(c);
+  if ("error" in g) return g.error;
+
+  const since = c.req.query("since");
+  const until = c.req.query("until");
+  const type = c.req.query("type");
+  const limit = Math.min(Math.max(Number(c.req.query("limit") ?? 100), 1), 1000);
+
+  // Compose conditions safely with postgres.js fragments.
+  const rows = await sql<any[]>`
+    SELECT event_id, address_hash, event_type, channel_id, payload, created_at
+    FROM events
+    WHERE 1=1
+      ${since ? sql`AND created_at >= ${since}` : sql``}
+      ${until ? sql`AND created_at <= ${until}` : sql``}
+      ${type  ? sql`AND event_type = ${type}` : sql``}
+    ORDER BY created_at DESC LIMIT ${limit}
+  `;
+  return c.json({ events: rows, count: rows.length, limit });
+});
+
+// GET /admin/funnel — register → first push %; basic launch-day metric
+adminRoutes.get("/admin/funnel", async (c) => {
+  const g = adminGuard(c);
+  if ("error" in g) return g.error;
+
+  // count distinct hashed addresses that did each step.
+  const rows = await sql<{ event_type: string; users: number }[]>`
+    SELECT event_type, count(DISTINCT address_hash)::int AS users
+    FROM events
+    WHERE address_hash IS NOT NULL
+      AND event_type IN ('auth_signin', 'register', 'friend_add_accepted', 'channel_create', 'signal_push', 'reaction_push', 'approve_signed')
+    GROUP BY event_type
+  `;
+  const counts: Record<string, number> = {};
+  for (const r of rows) counts[r.event_type] = r.users;
+  const auth_signin = counts["auth_signin"] ?? 0;
+  return c.json({
+    funnel: counts,
+    rate_register_over_signin: auth_signin > 0 ? (counts["register"] ?? 0) / auth_signin : null,
+    rate_first_push_over_register: (counts["register"] ?? 0) > 0
+      ? (counts["signal_push"] ?? 0) / (counts["register"] ?? 1) : null,
+  });
+});
+
+// GET /admin/retention?cohort_days=7 — D1 / D7 / D30 retention based on signal_push events
+adminRoutes.get("/admin/retention", async (c) => {
+  const g = adminGuard(c);
+  if ("error" in g) return g.error;
+
+  // For each user (address_hash), find their first auth_signin date and how many
+  // distinct days they pushed signals afterward. Truncated metric — basic but
+  // real signal of repeat use.
+  const rows = await sql<{ horizon: string; cohort: number; retained: number; rate: number }[]>`
+    WITH first_signin AS (
+      SELECT address_hash, MIN(date_trunc('day', created_at)) AS d0
+      FROM events
+      WHERE event_type = 'auth_signin' AND address_hash IS NOT NULL
+      GROUP BY address_hash
+    ),
+    activity AS (
+      SELECT e.address_hash, date_trunc('day', e.created_at) AS d, fs.d0
+      FROM events e
+      JOIN first_signin fs USING (address_hash)
+      WHERE e.event_type IN ('signal_push', 'reaction_push')
+    )
+    SELECT 'D1' AS horizon, COUNT(DISTINCT fs.address_hash)::int AS cohort,
+           COUNT(DISTINCT a.address_hash) FILTER (WHERE a.d - fs.d0 BETWEEN INTERVAL '1 day' AND INTERVAL '2 days')::int AS retained,
+           CASE WHEN COUNT(DISTINCT fs.address_hash) > 0
+             THEN (COUNT(DISTINCT a.address_hash) FILTER (WHERE a.d - fs.d0 BETWEEN INTERVAL '1 day' AND INTERVAL '2 days'))::float
+                  / COUNT(DISTINCT fs.address_hash) ELSE 0 END AS rate
+    FROM first_signin fs LEFT JOIN activity a USING (address_hash)
+    UNION ALL
+    SELECT 'D7' AS horizon, COUNT(DISTINCT fs.address_hash)::int,
+           COUNT(DISTINCT a.address_hash) FILTER (WHERE a.d - fs.d0 BETWEEN INTERVAL '7 day' AND INTERVAL '8 days')::int,
+           CASE WHEN COUNT(DISTINCT fs.address_hash) > 0
+             THEN (COUNT(DISTINCT a.address_hash) FILTER (WHERE a.d - fs.d0 BETWEEN INTERVAL '7 day' AND INTERVAL '8 days'))::float
+                  / COUNT(DISTINCT fs.address_hash) ELSE 0 END
+    FROM first_signin fs LEFT JOIN activity a USING (address_hash)
+    UNION ALL
+    SELECT 'D30' AS horizon, COUNT(DISTINCT fs.address_hash)::int,
+           COUNT(DISTINCT a.address_hash) FILTER (WHERE a.d - fs.d0 BETWEEN INTERVAL '30 day' AND INTERVAL '31 days')::int,
+           CASE WHEN COUNT(DISTINCT fs.address_hash) > 0
+             THEN (COUNT(DISTINCT a.address_hash) FILTER (WHERE a.d - fs.d0 BETWEEN INTERVAL '30 day' AND INTERVAL '31 days'))::float
+                  / COUNT(DISTINCT fs.address_hash) ELSE 0 END
+    FROM first_signin fs LEFT JOIN activity a USING (address_hash)
+  `;
+  return c.json({ retention: rows });
+});
+
+// ─── Reserved-username management ───────────────────────────────────────
+// (Mirrors migration 005's table.) Categories enforced server-side:
+//   - system / obscenity → hard-blocked, never grantable
+//   - rare → grantable to a specific address; recipient registers normally
+// All endpoints SUSU_ADMIN_TOKEN-gated via adminGuard.
+
+const RESERVED_NAME_RE = /^[a-z0-9_-]{1,40}$/;
+const RESERVED_CATEGORIES = new Set(["system", "rare", "obscenity"] as const);
+type ReservedCategory = "system" | "rare" | "obscenity";
+
+// POST /admin/usernames  body: {username, category, reason?}
+adminRoutes.post("/admin/usernames", async (c) => {
+  const g = adminGuard(c);
+  if ("error" in g) return g.error;
+  const body = await parseJsonBody(c);
+  if (body === null) return invalidJson(c);
+
+  const username = String(body?.username ?? "").trim().toLowerCase().replace(/^@/, "");
+  const category = String(body?.category ?? "");
+  const reason = body?.reason ? String(body.reason).slice(0, 280) : null;
+
+  if (!RESERVED_NAME_RE.test(username)) {
+    return c.json({ error: "invalid_username", message: "1-40 chars, lowercase a-z 0-9 _ -" }, 400);
+  }
+  if (!RESERVED_CATEGORIES.has(category as ReservedCategory)) {
+    return c.json({ error: "invalid_category", allowed: [...RESERVED_CATEGORIES] }, 400);
+  }
+
+  try {
+    const [row] = await sql<{ username: string; category: string; reason: string | null; created_at: Date }[]>`
+      INSERT INTO reserved_usernames(username, category, reason)
+      VALUES (${username}, ${category}, ${reason})
+      RETURNING username, category, reason, created_at
+    `;
+    return c.json({ ok: true, reserved: row }, 201);
+  } catch (e: any) {
+    if (e.code === "23505") {
+      return c.json({ error: "already_reserved", username }, 409);
+    }
+    throw e;
+  }
+});
+
+// GET /admin/usernames?category=&granted=true|false
+adminRoutes.get("/admin/usernames", async (c) => {
+  const g = adminGuard(c);
+  if ("error" in g) return g.error;
+
+  const category = c.req.query("category");
+  const granted = c.req.query("granted");
+  if (category && !RESERVED_CATEGORIES.has(category as ReservedCategory)) {
+    return c.json({ error: "invalid_category", allowed: [...RESERVED_CATEGORIES] }, 400);
+  }
+
+  const rows = await sql<any[]>`
+    SELECT username, category, reason, granted_to, granted_at, created_at
+    FROM reserved_usernames
+    WHERE 1=1
+      ${category ? sql`AND category = ${category}` : sql``}
+      ${granted === "true"  ? sql`AND granted_to IS NOT NULL` : sql``}
+      ${granted === "false" ? sql`AND granted_to IS NULL` : sql``}
+    ORDER BY category ASC, username ASC
+  `;
+  return c.json({ reserved: rows, count: rows.length });
+});
+
+// DELETE /admin/usernames/:username  — release back to the open pool
+adminRoutes.delete("/admin/usernames/:username", async (c) => {
+  const g = adminGuard(c);
+  if ("error" in g) return g.error;
+
+  const username = (c.req.param("username") ?? "").toLowerCase().replace(/^@/, "");
+  if (!RESERVED_NAME_RE.test(username)) {
+    return c.json({ error: "invalid_username" }, 400);
+  }
+
+  const deleted = await sql<{ username: string }[]>`
+    DELETE FROM reserved_usernames WHERE username = ${username} RETURNING username
+  `;
+  if (!deleted[0]) return c.json({ error: "not_reserved", username }, 404);
+  return c.json({ ok: true, released: username });
+});
+
+// POST /admin/usernames/:username/grant  body: {address}
+// Whitelist a specific address as the only one allowed to register the name.
+// system / obscenity categories REJECT — only `rare` may be granted.
+adminRoutes.post("/admin/usernames/:username/grant", async (c) => {
+  const g = adminGuard(c);
+  if ("error" in g) return g.error;
+
+  const username = (c.req.param("username") ?? "").toLowerCase().replace(/^@/, "");
+  if (!RESERVED_NAME_RE.test(username)) {
+    return c.json({ error: "invalid_username" }, 400);
+  }
+
+  const body = await parseJsonBody(c);
+  if (body === null) return invalidJson(c);
+  const address = String(body?.address ?? "");
+  if (!isValidSolanaAddress(address)) {
+    return c.json({ error: "invalid_address" }, 400);
+  }
+
+  // Pull current reserved row + ensure category is `rare`.
+  const [row] = await sql<{ category: string; granted_to: string | null }[]>`
+    SELECT category, granted_to FROM reserved_usernames WHERE username = ${username}
+  `;
+  if (!row) {
+    return c.json({ error: "not_reserved", message: "add to reserved list first via POST /admin/usernames" }, 404);
+  }
+  if (row.category !== "rare") {
+    return c.json({
+      error: "category_not_grantable",
+      category: row.category,
+      message: "only 'rare' names can be granted; system/obscenity are permanently locked",
+    }, 409);
+  }
+
+  // Make sure the destination identity exists (so FK granted_to → identities.address holds).
+  await sql`INSERT INTO identities(address) VALUES (${address}) ON CONFLICT (address) DO NOTHING`;
+
+  await sql`
+    UPDATE reserved_usernames
+       SET granted_to = ${address}, granted_at = NOW()
+     WHERE username = ${username}
+  `;
+  return c.json({ ok: true, username, granted_to: address });
+});

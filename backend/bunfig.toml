@@ -1,0 +1,4 @@
+[test]
+# Runs once before any test file is imported. Used to set env vars that
+# src/config.ts needs to see at module load (it caches them).
+preload = ["./tests/setup.ts"]

@@ -1,0 +1,28 @@
+{
+  "name": "susurration",
+  "version": "0.0.1",
+  "description": "Agent-to-agent trading signal communication. CLI alias: susu.",
+  "type": "module",
+  "bin": {
+    "susu": "./bin/susu.mjs",
+    "susurration": "./bin/susu.mjs"
+  },
+  "files": ["bin", "src"],
+  "scripts": {
+    "dev": "bun run src/index.ts",
+    "build": "bun build src/index.ts --outfile bin/susu.mjs --target node --format esm --banner '#!/usr/bin/env node'"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.95.8",
+    "bs58": "^6.0.0",
+    "tweetnacl": "^1.0.3"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: susu-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: susu
+      POSTGRES_PASSWORD: susu_dev
+      POSTGRES_DB: susurration
+    ports:
+      - "5432:5432"
+    volumes:
+      - susu_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U susu -d susurration"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  susu_pgdata:

@@ -1,0 +1,22 @@
+{
+  "name": "@susurration/bridge",
+  "version": "0.0.1",
+  "description": "Susurration → webhook fanout (OpenClaw / Discord / Slack / Feishu / Telegram).",
+  "type": "module",
+  "bin": {
+    "susu-bridge": "./bin/susu-bridge.mjs"
+  },
+  "files": ["bin", "src", "manifest", "README.md"],
+  "scripts": {
+    "dev": "bun run src/index.ts",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
