@@ -85,6 +85,7 @@ app.use("/api/identity/register", bodyLimit({ maxSize: DEFAULT_BODY_MAX, onError
 app.use("/api/billing/approve-tx", bodyLimit({ maxSize: DEFAULT_BODY_MAX, onError: onTooLarge }));
 app.use("/api/admin/usernames", bodyLimit({ maxSize: DEFAULT_BODY_MAX, onError: onTooLarge }));
 app.use("/api/admin/usernames/:username/grant", bodyLimit({ maxSize: DEFAULT_BODY_MAX, onError: onTooLarge }));
+app.use("/api/identity/auto-accept", bodyLimit({ maxSize: DEFAULT_BODY_MAX, onError: onTooLarge }));
 
 // G3-R-1 fix v2: drain the body to a Buffer BEFORE the route handler runs.
 // Why: when chunked Transfer-Encoding overflows bodyLimit's stream wrapper,
@@ -197,7 +198,7 @@ api.route("/", adminRoutes);
 // box) — just the endpoints most likely to be hand-poked.
 const POST_ONLY_API_PATTERNS: RegExp[] = [
   /^\/auth\/(nonce|verify|stream-token)$/,
-  /^\/identity\/register$/,
+  /^\/identity\/(register|auto-accept)$/,
   /^\/friends\/(add|accept|remove)$/,
   /^\/channels$/,
   /^\/channels\/[^/]+\/(invite|leave|kick|transfer-owner|signals)$/,

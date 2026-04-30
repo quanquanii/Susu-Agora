@@ -192,3 +192,25 @@ identityRoutes.get("/identity/by-username/:username", async (c) => {
   if (!row) return c.json({ error: "username_not_found", username }, 404);
   return c.json(row);
 });
+
+// POST /identity/auto-accept  body: {value: boolean}
+// Toggle the friend-add gate. Default for new identities is FALSE
+// (migration 006). When false, anyone calling /friends/add against this
+// user creates a pending friend_request the user (or their agent) must
+// explicitly accept via /friends/accept. When true, friend adds become
+// channel-creating immediately. Users in active dogfood circles where
+// they trust everyone may flip to true; default conservative.
+identityRoutes.post("/identity/auto-accept", async (c) => {
+  let me: string;
+  try {
+    me = await authedAddress(c.req.header("authorization"));
+  } catch (e) {
+    if (e instanceof AuthError) return c.json({ error: e.reason }, e.status as 400 | 401);
+    throw e;
+  }
+  const body = await parseJsonBody(c);
+  if (body === null) return invalidJson(c);
+  const value = Boolean(body?.value ?? body?.on);
+  await sql`UPDATE identities SET auto_accept_friends = ${value} WHERE address = ${me}`;
+  return c.json({ ok: true, auto_accept_friends: value });
+});

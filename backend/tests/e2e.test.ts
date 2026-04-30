@@ -311,12 +311,14 @@ describeE2E("Susurration E2E (D7+D13)", () => {
 
   // ── Friends + 1-on-1 channel auto-create (D7 v0.5 + D13) ────────────
 
-  test("friends: auto-accept on (default) → 1-on-1 channel created in one call", async () => {
+  test("friends: auto-accept on → 1-on-1 channel created in one call", async () => {
+    // Default (per migration 006) is OFF; flip B to ON for this test.
     const wA = makeWallet(); const tA = await login(wA);
     const wB = makeWallet(); const tB = await login(wB);
     await register(tA, uname("a"));
     const bUsername = uname("b");
     await register(tB, bUsername);
+    await sqlMod.sql`UPDATE identities SET auto_accept_friends = true WHERE address = ${wB.address}`;
 
     const r = await app.fetch(new Request("http://test/api/friends/add", {
       method: "POST", headers: authHeaders(tA), body: JSON.stringify({ username: bUsername }),
@@ -341,6 +343,7 @@ describeE2E("Susurration E2E (D7+D13)", () => {
     await register(tA, uname("a"));
     const bUsername = uname("b");
     await register(tB, bUsername);
+    await sqlMod.sql`UPDATE identities SET auto_accept_friends = true WHERE address = ${wB.address}`;
     await app.fetch(new Request("http://test/api/friends/add", {
       method: "POST", headers: authHeaders(tA), body: JSON.stringify({ username: bUsername }),
     }));
@@ -350,6 +353,42 @@ describeE2E("Susurration E2E (D7+D13)", () => {
     expect(r2.status).toBe(200);
     const body = await r2.json() as any;
     expect(body.status).toBe("already_friends");
+  });
+
+  test("friends: default OFF (post migration 006) — adds queue as pending", async () => {
+    const wA = makeWallet(); const tA = await login(wA);
+    const wB = makeWallet(); const tB = await login(wB); void tB;
+    await register(tA, uname("a"));
+    const bUsername = uname("b");
+    await register(tB, bUsername);
+    // Both default to OFF — no UPDATE needed.
+    const r = await app.fetch(new Request("http://test/api/friends/add", {
+      method: "POST", headers: authHeaders(tA), body: JSON.stringify({ username: bUsername }),
+    }));
+    expect(r.status).toBe(201);
+    const body = await r.json() as any;
+    expect(body.status).toBe("pending");
+    expect(body.request_id).toBeTruthy();
+  });
+
+  test("identity/auto-accept toggle endpoint", async () => {
+    const w = makeWallet(); const t = await login(w);
+    await register(t, uname("toggle"));
+    // start: false (default)
+    const me1 = await (await app.fetch(new Request("http://test/api/identity/whoami", { headers: authHeaders(t) }))).json() as any;
+    expect(me1.auto_accept_friends).toBe(false);
+    // flip ON
+    const r1 = await app.fetch(new Request("http://test/api/identity/auto-accept", {
+      method: "POST", headers: authHeaders(t), body: JSON.stringify({ value: true }),
+    }));
+    expect(r1.status).toBe(200);
+    expect((await r1.json() as any).auto_accept_friends).toBe(true);
+    // flip OFF
+    const r2 = await app.fetch(new Request("http://test/api/identity/auto-accept", {
+      method: "POST", headers: authHeaders(t), body: JSON.stringify({ value: false }),
+    }));
+    expect(r2.status).toBe(200);
+    expect((await r2.json() as any).auto_accept_friends).toBe(false);
   });
 
   test("friends: auto-accept off → creates request; accept creates channel", async () => {
@@ -390,6 +429,8 @@ describeE2E("Susurration E2E (D7+D13)", () => {
     const wC = makeWallet(); await login(wC); // bystander
     await register(tA, uname("a"));
     const bU = uname("b"); await register(tB, bU);
+    // Need bU's auto_accept ON so the add creates a 1-on-1 channel directly.
+    await sqlMod.sql`UPDATE identities SET auto_accept_friends = true WHERE address = ${wB.address}`;
     const r = await app.fetch(new Request("http://test/api/friends/add", {
       method: "POST", headers: authHeaders(tA), body: JSON.stringify({ username: bU }),
     }));
@@ -569,6 +610,8 @@ describeE2E("Susurration E2E (D7+D13)", () => {
     const wB = makeWallet(); const tB = await login(wB);
     await register(tA, uname("a"));
     const bU = uname("b"); await register(tB, bU);
+    // bU's auto-accept ON so the add creates a 1-on-1 channel directly.
+    await sqlMod.sql`UPDATE identities SET auto_accept_friends = true WHERE address = ${wB.address}`;
     const add = await app.fetch(new Request("http://test/api/friends/add", {
       method: "POST", headers: authHeaders(tA), body: JSON.stringify({ username: bU }),
     }));

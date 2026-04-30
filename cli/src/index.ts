@@ -56,6 +56,7 @@ Billing
 
 Misc
   susu doc                                    Full agent reference (pipe to your agent)
+  susu privacy [on|off]                       Toggle the friend gate (default OFF — incoming adds queue as requests)
   susu config                                 Show config + session info
   susu help                                   This text
 
@@ -93,6 +94,7 @@ async function main() {
     usage: cmdUsage,
     doc: cmdDoc,
     docs: cmdDoc, // alias — typo-tolerant
+    privacy: cmdPrivacy,
     config: cmdConfig,
   };
 
@@ -383,13 +385,14 @@ async function cmdFriends(args: string[]): Promise<number> {
     return printJsonOrTable(args.slice(1), out, (o) => `removed channel ${o.channel_id}\n`);
   }
 
-  // default: list friends + pending requests
-  const [friends, requests] = await Promise.all([
+  // default: list friends + pending incoming + pending outgoing
+  const [friends, requests, outgoing] = await Promise.all([
     api<{ friends: any[] }>(cfg, "/friends"),
     api<{ requests: any[] }>(cfg, "/friends/requests").catch(() => ({ requests: [] })),
+    api<{ requests: any[] }>(cfg, "/friends/requests/outgoing").catch(() => ({ requests: [] })),
   ]);
   if (args.includes("--json")) {
-    process.stdout.write(JSON.stringify({ ...friends, ...requests }, null, 2) + "\n");
+    process.stdout.write(JSON.stringify({ friends: friends.friends, incoming: requests.requests, outgoing: outgoing.requests }, null, 2) + "\n");
     return 0;
   }
   // Show only @handles. Address + channel_id + request_id are backend
@@ -397,11 +400,15 @@ async function cmdFriends(args: string[]): Promise<number> {
   const fLines = friends.friends.length === 0
     ? "  (none)"
     : friends.friends.map((f: any) => `  ${fmtHandle(f.friend_username)}`).join("\n");
-  const rLines = requests.requests.length === 0
+  const inLines = requests.requests.length === 0
     ? ""
-    : `\npending incoming requests:\n` +
+    : `\npending incoming (use \`susu accept @x\` to accept):\n` +
       requests.requests.map((r: any) => `  ${fmtHandle(r.from_username)}`).join("\n") + "\n";
-  process.stdout.write(`friends:\n${fLines}\n${rLines}`);
+  const outLines = outgoing.requests.length === 0
+    ? ""
+    : `\npending outgoing (waiting on the other side to accept):\n` +
+      outgoing.requests.map((r: any) => `  ${fmtHandle(r.to_username)}`).join("\n") + "\n";
+  process.stdout.write(`friends:\n${fLines}\n${inLines}${outLines}`);
   return 0;
 }
 
@@ -740,6 +747,44 @@ async function cmdUsage(args: string[]): Promise<number> {
     o.items.slice(0, 10).map((i: any) =>
       `  ${i.created_at}  ${i.call_type.padEnd(14)}  $${Number(i.cost_usd).toFixed(4)}`,
     ).join("\n") + "\n",
+  );
+}
+
+// `susu privacy` — toggle whether incoming friend adds auto-create a
+// channel (`on`) or queue a request the user must accept (`off`).
+// Default for new accounts is `off` (per migration 006). Args:
+//   susu privacy            → show current setting + brief explanation
+//   susu privacy on         → flip to auto-accept (use only for trusted circles)
+//   susu privacy off        → flip back to gate (default)
+async function cmdPrivacy(args: string[]): Promise<number> {
+  const cfg = await loadConfig();
+  if (!cfg.token) { process.stderr.write("not logged in\n"); return 2; }
+  const sub = (args[0] ?? "").toLowerCase();
+
+  if (!sub) {
+    // Show current
+    const me = await api<any>(cfg, "/identity/whoami");
+    const on = !!me.auto_accept_friends;
+    process.stdout.write(
+      `auto-accept friends: ${on ? "ON  (anyone can add you and immediately push)" : "OFF (incoming adds queue as requests; you accept manually)"}\n` +
+      (on
+        ? `\nflip OFF (recommended for most users):  susu privacy off\n`
+        : `\nflip ON  (only if you trust everyone in your circle):  susu privacy on\n`),
+    );
+    return 0;
+  }
+
+  if (sub !== "on" && sub !== "off") {
+    process.stderr.write("usage: susu privacy [on|off]\n");
+    return 1;
+  }
+
+  const value = sub === "on";
+  const out = await api<any>(cfg, "/identity/auto-accept", {
+    method: "POST", body: JSON.stringify({ value }),
+  });
+  return printJsonOrTable(args, out, () =>
+    `auto-accept friends: ${value ? "ON" : "OFF"}\n`,
   );
 }
 

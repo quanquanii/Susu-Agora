@@ -221,4 +221,20 @@ friendRoutes.get("/friends/requests", async (c) => {
   return c.json({ requests: rows });
 });
 
+// GET /friends/requests/outgoing — friend requests this user has sent that
+// are still pending (recipient has auto_accept=false and hasn't accepted).
+// Lets a caller's agent answer "is my add to @alice still waiting?".
+friendRoutes.get("/friends/requests/outgoing", async (c) => {
+  let me: string;
+  try { me = await authedAddress(c.req.header("authorization"));} catch (e) { return authError(c, e); }
+  const rows = await sql<{ request_id: string; to_addr: string; to_username: string | null; created_at: Date }[]>`
+    SELECT fr.request_id, fr.to_addr, i.username AS to_username, fr.created_at
+    FROM friend_requests fr
+    JOIN identities i ON i.address = fr.to_addr
+    WHERE fr.from_addr = ${me}
+    ORDER BY fr.created_at DESC
+  `;
+  return c.json({ requests: rows });
+});
+
 void hashAddress; // re-export hint for events module side-effect
