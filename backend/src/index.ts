@@ -199,7 +199,12 @@ const POST_ONLY_API_PATTERNS: RegExp[] = [
   /^\/auth\/(nonce|verify|stream-token)$/,
   /^\/identity\/register$/,
   /^\/friends\/(add|accept|remove)$/,
+  /^\/channels$/,
+  /^\/channels\/[^/]+\/(invite|leave|kick|transfer-owner|signals)$/,
+  /^\/signals\/[^/]+\/reactions$/,
   /^\/billing\/approve-tx$/,
+  /^\/admin\/usernames$/,
+  /^\/admin\/usernames\/[^/]+\/grant$/,
 ];
 api.all("*", (c) => {
   if (c.req.method !== "POST") {

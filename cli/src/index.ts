@@ -17,50 +17,49 @@ import { AGENT_DOC } from "../../shared/agent-doc.ts";
 
 const HELP = `susu — Susurration CLI (alias of \`susurration\`)
 
-Auth
-  susu init [--import KEYFILE_OR_BASE58]    Create / import a local keypair
-  susu login                                 Sign nonce → store session token
-  susu register @handle                      Lock a permanent username (immutable)
-  susu whoami                                Print authed identity
-  susu logout                                Clear session token
+Account
+  susu init [--import SECRET]                Create or import your account
+  susu login                                  Sign in
+  susu register @handle                       Lock a permanent handle (5-20 chars, immutable)
+  susu whoami                                 Show your handle
+  susu logout                                 End session
 
-Friends (1-on-1 channels)
-  susu add @handle                           Add a friend (auto-accept by default)
-  susu accept @handle                        Accept a pending friend request
-  susu friends                               List friends + pending requests
-  susu friends remove @handle                Remove a friend (silent for both sides)
+Friends
+  susu add @handle                            Add a friend (auto-creates a private channel)
+  susu accept @handle                         Accept a pending friend request
+  susu friends                                List friends + pending requests
+  susu friends remove @handle                 Remove a friend
 
-Groups (multi-person channels)
-  susu group create <name> @h1 @h2 ...       Create a group, owner = you
-  susu group members <channel_id>            List members
-  susu group invite <channel_id> @handle     Invite a friend by handle
-  susu group leave <channel_id>              Leave; if owner, auto-elect next member
-  susu group kick <channel_id> @handle       Kick a member (owner only, no cooldown)
-  susu group transfer-owner <channel_id> @h  Transfer ownership (direct, no vote)
+Groups (2-9 people sharing one channel)
+  susu group create <name> @h1 @h2 ...        Create a group; owner = you
+  susu group members <channel_id>             List members
+  susu group invite <channel_id> @handle      Invite a friend
+  susu group leave <channel_id>               Leave; ownership auto-passes to next member
+  susu group kick <channel_id> @handle        Kick a member (owner only)
+  susu group transfer-owner <channel_id> @h   Transfer ownership
 
-Channel meta KV (D13 open protocol — agents compose self-rules here)
-  susu meta get <channel_id>                 Read meta JSON
-  susu meta set <channel_id> -j JSON         Replace meta (owner only, group only)
-  susu meta patch <channel_id> -j JSON       Shallow-merge meta
+Group rules (free-form JSON; agents compose their own conventions)
+  susu meta get <channel_id>                  Read group rules
+  susu meta set <channel_id> -j JSON          Replace rules (owner only, group only)
+  susu meta patch <channel_id> -j JSON        Shallow-merge rules
 
-Signals
-  susu push <target> [-m TEXT | -j JSON]     <target> = @handle (1-on-1) or <channel_id> (group)
-  susu watch <target>                        SSE-tail signals (Ctrl-C exits)
-  susu signals <target>                      Recent signals
-  susu react <signal_id> [-m TEXT | -j JSON] React to a signal
+Messaging
+  susu push <target> [-m TEXT | -j JSON]      <target> = @handle (1-on-1) or <channel_id> (group)
+  susu watch <target>                         Live-tail incoming messages (Ctrl-C exits)
+  susu signals <target>                       Recent messages
+  susu react <signal_id> [-m TEXT | -j JSON]  React to a message
 
-Billing (BETA = free; paid mode triggers approve on first 402)
-  susu allowance                             Show on-chain SPL allowance + cluster
-  susu approve [<amount_usd=100>]            Build approve tx (signed in browser)
-  susu spender                               Show current spender pubkey + USDC mint
-  susu usage                                 Recent usage rows + totals
+Billing
+  susu allowance                              Status (BETA = free; paid mode shows balance)
+  susu approve [<amount_usd=100>]             Top up (paid mode; signed in browser)
+  susu usage                                  Recent activity + totals
 
 Misc
-  susu doc                                   Print the full AGENT DOC (paste / pipe to your agent)
-  susu config                                Print API URL + config path
-  susu help                                  This text
+  susu doc                                    Full agent reference (pipe to your agent)
+  susu config                                 Show config + session info
+  susu help                                   This text
 
-Env: SUSU_API_URL (default http://localhost:8787/api), SUSU_HOME (default ~/.susu)
+Env: SUSU_API_URL (defaults to https://susurration.fly.dev/api), SUSU_HOME (default ~/.susu)
 `;
 
 type Cmd = (args: string[]) => Promise<number>;
@@ -91,7 +90,6 @@ async function main() {
     react: cmdReact,
     allowance: cmdAllowance,
     approve: cmdApprove,
-    spender: cmdSpender,
     usage: cmdUsage,
     doc: cmdDoc,
     docs: cmdDoc, // alias — typo-tolerant
@@ -262,17 +260,17 @@ async function cmdRegister(args: string[]): Promise<number> {
   if (!raw) { process.stderr.write("usage: susu register @handle [--yes]\n"); return 1; }
   const username = (raw.startsWith("@") ? raw.slice(1) : raw).toLowerCase();
 
-  // Client-side FORMAT check (not policy). Catches typos / wrong-case /
-  // too-long names before round-tripping. Length-policy (5-char self-serve
-  // floor) and reserved-list (system / rare / obscenity) live on the server
-  // because client doesn't know if the caller has been granted a 3-4 char
-  // rare name. Server returns 409 with category + reason when policy fails;
-  // client just stays out of policy enforcement.
-  const FORMAT_RE = /^[a-z0-9_-]{3,20}$/;
+  // Client-side check matches the documented self-serve rule (5-20 chars).
+  // 3-4 char "rare" names are reserved for operator-grant only; the operator
+  // grants them by setting the username directly on the recipient's account
+  // (admin endpoint), so a recipient never needs to call `register` for
+  // those — they appear as already-set on next `whoami`. Keeping this rule
+  // single-source between DOC and CLI simplifies error attribution.
+  const FORMAT_RE = /^[a-z0-9_-]{5,20}$/;
   if (!FORMAT_RE.test(username)) {
     process.stderr.write(
       `invalid username "@${username}":\n` +
-      `  must be 3-20 chars, lowercase a-z 0-9 _ -\n`,
+      `  must be 5-20 chars, lowercase a-z 0-9 _ -\n`,
     );
     return 1;
   }
@@ -728,18 +726,6 @@ async function cmdApprove(args: string[]): Promise<number> {
       `(CLI cannot sign Solana txs directly — keypair format differs from Phantom.)\n`
     );
   });
-}
-
-async function cmdSpender(args: string[]): Promise<number> {
-  const cfg = await loadConfig();
-  // Public endpoint — auth not required.
-  const out = await api<any>(cfg, "/billing/spender", { auth: false });
-  return printJsonOrTable(args, out, (o) =>
-    `spender_pubkey:    ${o.spender_pubkey}\n` +
-    `usdc_mint:         ${o.usdc_mint}\n` +
-    `cluster:           ${o.cluster}\n` +
-    `rate_per_call_usd: $${o.rate_usd_per_call}\n`,
-  );
 }
 
 async function cmdUsage(args: string[]): Promise<number> {

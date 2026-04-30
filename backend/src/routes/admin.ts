@@ -202,7 +202,14 @@ adminRoutes.delete("/admin/usernames/:username", async (c) => {
 });
 
 // POST /admin/usernames/:username/grant  body: {address}
-// Whitelist a specific address as the only one allowed to register the name.
+// 2026-04-30: changed from "whitelist + recipient registers" to "directly
+// lock username on the recipient's identity row". Reasons:
+//   1. Recipient no longer needs to call `susu register` for granted names —
+//      after grant they see @<name> on `whoami` immediately. Cleaner UX.
+//   2. CLI client-side check stays at {5,20} (matches DOC self-serve rule);
+//      3-4 char rare names go through this admin path only, never through
+//      the user-facing `register` flow. Three layers (DOC / CLI / server)
+//      no longer disagree on the floor.
 // system / obscenity categories REJECT — only `rare` may be granted.
 adminRoutes.post("/admin/usernames/:username/grant", async (c) => {
   const g = adminGuard(c);
@@ -235,13 +242,42 @@ adminRoutes.post("/admin/usernames/:username/grant", async (c) => {
     }, 409);
   }
 
-  // Make sure the destination identity exists (so FK granted_to → identities.address holds).
-  await sql`INSERT INTO identities(address) VALUES (${address}) ON CONFLICT (address) DO NOTHING`;
-
-  await sql`
-    UPDATE reserved_usernames
-       SET granted_to = ${address}, granted_at = NOW()
-     WHERE username = ${username}
-  `;
-  return c.json({ ok: true, username, granted_to: address });
+  // Atomic: ensure the recipient identity exists, refuse if they already
+  // locked another handle (usernames are immutable per D13), then lock
+  // the granted username on their identity row + mark the reserved entry
+  // as granted-to. Concurrent UNIQUE collision (someone else grabbed the
+  // name in between) bubbles up as 409.
+  try {
+    await sql.begin(async (tx) => {
+      await tx`INSERT INTO identities(address) VALUES (${address}) ON CONFLICT (address) DO NOTHING`;
+      const cur = await tx<{ username: string | null }[]>`
+        SELECT username FROM identities WHERE address = ${address}
+      `;
+      if (cur[0]?.username && cur[0].username !== username) {
+        throw Object.assign(new Error("recipient_already_locked"), {
+          status: 409,
+          detail: { current: cur[0].username },
+        });
+      }
+      await tx`UPDATE identities SET username = ${username} WHERE address = ${address}`;
+      await tx`
+        UPDATE reserved_usernames
+           SET granted_to = ${address}, granted_at = NOW()
+         WHERE username = ${username}
+      `;
+    });
+  } catch (e: any) {
+    if (e?.status === 409) {
+      return c.json({
+        error: "recipient_already_locked",
+        message: "recipient already has a different handle and usernames are immutable",
+        current: e.detail?.current,
+      }, 409);
+    }
+    if (e?.code === "23505") {
+      return c.json({ error: "username_taken", message: "concurrent registration grabbed this name first" }, 409);
+    }
+    throw e;
+  }
+  return c.json({ ok: true, username, locked_to: address });
 });

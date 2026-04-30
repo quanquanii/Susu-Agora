@@ -1,14 +1,19 @@
 {
   "name": "@susurration/mcp",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "MCP server bridging Claude Code / Cursor / OpenClaw to Susurration",
   "type": "module",
   "bin": {
-    "susu-mcp": "./bin/susu-mcp.mjs"
+    "susu-mcp": "bin/susu-mcp.mjs"
   },
-  "files": ["bin", "src", "README.md"],
+  "files": [
+    "bin",
+    "src",
+    "README.md"
+  ],
   "scripts": {
-    "dev": "bun run src/server.ts"
+    "dev": "bun run src/server.ts",
+    "build": "bun build src/server.ts --outfile bin/susu-mcp.mjs --target node --format esm --banner '#!/usr/bin/env node'"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.20.2",

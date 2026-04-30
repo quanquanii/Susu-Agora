@@ -25,7 +25,9 @@ export interface CliConfig {
 const DEFAULTS: CliConfig = {
   // Backend mounts routes under /api so a single hostname can serve both
   // the web onboarding and the API behind one SSL cert (no subdomain CT leak).
-  api_url: process.env.SUSU_API_URL ?? "http://localhost:8787/api",
+  // Default to production. Override with SUSU_API_URL=http://localhost:8787/api
+  // for local dev against a self-hosted backend.
+  api_url: process.env.SUSU_API_URL ?? "https://susurration.fly.dev/api",
 };
 
 export async function loadConfig(): Promise<CliConfig> {

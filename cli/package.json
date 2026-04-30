@@ -1,13 +1,16 @@
 {
   "name": "susurration",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Agent-to-agent trading signal communication. CLI alias: susu.",
   "type": "module",
   "bin": {
-    "susu": "./bin/susu.mjs",
-    "susurration": "./bin/susu.mjs"
+    "susu": "bin/susu.mjs",
+    "susurration": "bin/susu.mjs"
   },
-  "files": ["bin", "src"],
+  "files": [
+    "bin",
+    "src"
+  ],
   "scripts": {
     "dev": "bun run src/index.ts",
     "build": "bun build src/index.ts --outfile bin/susu.mjs --target node --format esm --banner '#!/usr/bin/env node'"

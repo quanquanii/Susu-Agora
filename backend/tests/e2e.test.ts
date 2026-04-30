@@ -232,7 +232,7 @@ describeE2E("Susurration E2E (D7+D13)", () => {
     expect((await r.json() as any).category).toBe("obscenity");
   });
 
-  test("admin: full grant flow — reserve rare → grant → recipient can register, others can't", async () => {
+  test("admin: full grant flow — reserve rare → grant directly locks recipient's @handle", async () => {
     const adminAuth = { "content-type": "application/json", authorization: `Bearer ${TEST_ADMIN_TOKEN}` };
 
     // Use a unique 4-char rare name per test run to avoid cross-test collisions.
@@ -245,7 +245,7 @@ describeE2E("Susurration E2E (D7+D13)", () => {
     }));
     expect(reserve.status).toBe(201);
 
-    // 2. before grant, anyone trying to register hits 409
+    // 2. before grant, anyone trying to register hits 409 username_reserved
     const wA = makeWallet(); const tA = await login(wA);
     const before = await app.fetch(new Request("http://test/api/identity/register", {
       method: "POST", headers: authHeaders(tA), body: JSON.stringify({ username: rareName }),
@@ -253,29 +253,34 @@ describeE2E("Susurration E2E (D7+D13)", () => {
     expect(before.status).toBe(409);
     expect((await before.json() as any).category).toBe("rare");
 
-    // 3. admin grants to alice
+    // 3. admin grants to alice — server directly locks identities.username
+    //    on alice's row. Recipient does NOT need to register afterwards.
     const grant = await app.fetch(new Request(`http://test/api/admin/usernames/${rareName}/grant`, {
       method: "POST", headers: adminAuth,
       body: JSON.stringify({ address: wA.address }),
     }));
     expect(grant.status).toBe(200);
+    const grantBody = await grant.json() as any;
+    expect(grantBody.username).toBe(rareName);
+    expect(grantBody.locked_to).toBe(wA.address);
 
-    // 4. alice can now register the rare name
-    const ok = await app.fetch(new Request("http://test/api/identity/register", {
+    // 4. alice's whoami immediately shows the granted handle (no register call)
+    const me = await app.fetch(new Request("http://test/api/identity/whoami", { headers: authHeaders(tA) }));
+    expect(me.status).toBe(200);
+    expect((await me.json() as any).username).toBe(rareName);
+
+    // 5. if alice tries register the same name again → 409 username_already_locked
+    //    (handles are immutable per D13).
+    const reReg = await app.fetch(new Request("http://test/api/identity/register", {
       method: "POST", headers: authHeaders(tA), body: JSON.stringify({ username: rareName }),
     }));
-    expect(ok.status).toBe(200);
-    expect((await ok.json() as any).username).toBe(rareName);
+    expect(reReg.status).toBe(409);
 
-    // 5. bob (different keypair) still gets 409 (granted_to is alice, not bob)
+    // 6. bob (different keypair) trying register the same name → 409 (UNIQUE collision)
     const wB = makeWallet(); const tB = await login(wB);
     const bobTry = await app.fetch(new Request("http://test/api/identity/register", {
       method: "POST", headers: authHeaders(tB), body: JSON.stringify({ username: rareName }),
     }));
-    // Bob hits the regular UNIQUE collision path (alice already locked it) →
-    // expect either 409 username_taken (if alice's row already exists) or
-    // 409 username_reserved (if reserved row blocks). Either is correct;
-    // production behaviour just needs to be "not 200".
     expect(bobTry.status).toBe(409);
   });
 

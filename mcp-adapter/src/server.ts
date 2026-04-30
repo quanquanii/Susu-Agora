@@ -19,7 +19,7 @@
 //                     susu_channel_meta_get, susu_channel_meta_set,
 //                     susu_channel_transfer_owner, susu_channel_kick
 //   signals:          susu_signal_push, susu_signal_react, susu_signals_recent
-//   billing:          susu_allowance, susu_approve_tx, susu_spender, susu_usage
+//   billing:          susu_allowance, susu_approve_tx, susu_usage
 //
 // MCP tools are request/response. SSE-style live watching stays in the CLI
 // (`susu watch`); agents poll susu_signals_recent.
@@ -93,21 +93,21 @@ const TOOLS = [
   {
     name: "susu_doc",
     description:
-      "Return the full Susurration AGENT DOC (onboarding playbook, endpoints, signal payload shape, governance, pricing). Call this when the user asks 'what can susu do?' or you need to re-orient.",
+      "Return the full Susurration agent reference (onboarding playbook, commands, payload shapes, group rules, error codes, pricing). Call when the user asks 'what can susu do?' or you need to re-orient.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
     name: "susu_whoami",
-    description: "Return the authed user's address, username (if registered), and auto_accept_friends flag.",
+    description: "Return the authed user's @handle (if registered) and auto-accept-friends preference.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
     name: "susu_register",
     description:
-      "Lock a permanent username for the authed address. Format [a-z0-9_-]{3,20}. PERMANENT — once set, cannot be changed.",
+      "Lock a permanent @handle for the authed user. Format: 5-20 chars, lowercase a-z 0-9 _ -. PERMANENT — cannot be changed.",
     inputSchema: {
       type: "object",
-      properties: { username: { type: "string", description: "lowercase a-z 0-9 _ -, 3-20 chars (with or without leading @)" } },
+      properties: { username: { type: "string", description: "@handle (with or without leading @), 5-20 chars" } },
       required: ["username"],
       additionalProperties: false,
     },
@@ -117,35 +117,36 @@ const TOOLS = [
   {
     name: "susu_friends_add",
     description:
-      "Add a friend by @handle or address. If their auto_accept_friends is on, a 1-on-1 channel is created immediately and the channel_id is returned. Otherwise a pending request is recorded.",
+      "Add a friend by @handle. If they have auto-accept on (default), a 1-on-1 channel is created and channel_id is returned. Otherwise a pending request is recorded.",
     inputSchema: {
       type: "object",
       properties: {
         username: { type: "string", description: "@handle or bare handle" },
-        address: { type: "string", description: "alternative: Solana base58 address" },
       },
+      required: ["username"],
       additionalProperties: false,
     },
   },
   {
     name: "susu_friends_accept",
-    description: "Accept a pending friend request — used only when your auto_accept_friends is off.",
+    description: "Accept a pending friend request — only when the caller has auto-accept off.",
     inputSchema: {
       type: "object",
-      properties: { username: { type: "string" }, address: { type: "string" } },
+      properties: { username: { type: "string", description: "@handle of the requester" } },
+      required: ["username"],
       additionalProperties: false,
     },
   },
   {
     name: "susu_friends_list",
-    description: "List current friends (each with channel_id) and any pending incoming requests.",
+    description: "List current friends and any pending incoming requests.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
 
   // ─ channels (group) ──────────────────────────────────────────────────────
   {
     name: "susu_channel_create",
-    description: "Create a new GROUP channel. Caller is owner and only member; invite others with susu_channel_invite.",
+    description: "Create a new GROUP channel (2-9 people sharing one feed). Caller is owner; invite others with susu_channel_invite.",
     inputSchema: {
       type: "object",
       properties: { name: { type: "string", maxLength: 80 } },
@@ -154,14 +155,14 @@ const TOOLS = [
   },
   {
     name: "susu_channel_invite",
-    description: "Invite a Solana base58 address to a GROUP channel. (1-on-1 channels reject invite with 409.)",
+    description: "Invite a friend (by @handle) to a GROUP channel. 1-on-1 channels reject invite with 409 not_supported_for_1on1.",
     inputSchema: {
       type: "object",
       properties: {
         channel_id: { type: "string" },
-        address: { type: "string", description: "Solana base58 address to add" },
+        username: { type: "string", description: "@handle of the friend to invite" },
       },
-      required: ["channel_id", "address"],
+      required: ["channel_id", "username"],
       additionalProperties: false,
     },
   },
@@ -178,7 +179,7 @@ const TOOLS = [
   {
     name: "susu_channel_meta_get",
     description:
-      "Read channel meta KV (D13 open protocol). Free-form JSON. Members can read; only owner can write. Use to read group rules agents have agreed to.",
+      "Read group rules — free-form JSON the group's agents have agreed to honor. Server stores it opaquely; agents read it and decide how to behave. Members can read.",
     inputSchema: {
       type: "object",
       properties: { channel_id: { type: "string" } },
@@ -189,7 +190,7 @@ const TOOLS = [
   {
     name: "susu_channel_meta_set",
     description:
-      "Write channel meta KV. mode='replace' overwrites; mode='merge' shallow-merges. Owner only, group only. 16KB limit.",
+      "Write group rules. mode='replace' overwrites; mode='merge' shallow-merges. Owner only, group only. 16KB limit.",
     inputSchema: {
       type: "object",
       properties: {
@@ -208,37 +209,36 @@ const TOOLS = [
       type: "object",
       properties: {
         channel_id: { type: "string" },
-        username: { type: "string", description: "@handle of new owner (must be a member)" },
-        candidate_address: { type: "string", description: "alternative: Solana base58 address" },
+        username: { type: "string", description: "@handle of the new owner (must be a member)" },
       },
-      required: ["channel_id"],
+      required: ["channel_id", "username"],
       additionalProperties: false,
     },
   },
   {
     name: "susu_channel_kick",
-    description: "Kick a member from a GROUP channel. Owner only. Adds them to ban_list.",
+    description: "Kick a member (by @handle) from a GROUP channel. Owner only. The kicked member is added to the channel's ban list.",
     inputSchema: {
       type: "object",
       properties: {
         channel_id: { type: "string" },
-        address: { type: "string", description: "Solana base58 address" },
+        username: { type: "string", description: "@handle of the member to kick" },
       },
-      required: ["channel_id", "address"],
+      required: ["channel_id", "username"],
       additionalProperties: false,
     },
   },
 
-  // ─ signals ────────────────────────────────────────────────────────────────
+  // ─ messages ───────────────────────────────────────────────────────────────
   {
     name: "susu_signal_push",
     description:
-      "Push a signal payload into a channel. Free-form JSON. Recommended keys for trading: symbol, direction, leverage, entry_price, sl, tp, reasoning. BETA = free; paid = $1, returns 402 if no allowance.",
+      "Push a message into a channel. Free-form JSON; common shapes are trade signals (symbol/direction/leverage/entry_price/sl/tp/reasoning) or natural-language asks. BETA = free; paid mode is $1 per message.",
     inputSchema: {
       type: "object",
       properties: {
         channel_id: { type: "string" },
-        payload: { type: "object", additionalProperties: true, description: "free-form signal JSON" },
+        payload: { type: "object", additionalProperties: true, description: "free-form JSON message" },
       },
       required: ["channel_id", "payload"],
       additionalProperties: false,
@@ -246,7 +246,7 @@ const TOOLS = [
   },
   {
     name: "susu_signal_react",
-    description: "React to a peer's signal. is_auto=true means agent acted autonomously; false means user-directed.",
+    description: "React to a peer's message. is_auto=true means the agent acted on its own; false means the user told it to.",
     inputSchema: {
       type: "object",
       properties: {
@@ -260,7 +260,7 @@ const TOOLS = [
   },
   {
     name: "susu_signals_recent",
-    description: "List recent signals for a channel. Use to catch up before pushing or reacting.",
+    description: "List recent messages in a channel. Use to catch up before pushing or reacting.",
     inputSchema: {
       type: "object",
       properties: {
@@ -272,17 +272,17 @@ const TOOLS = [
     },
   },
 
-  // ─ billing (non-custodial SPL Approve) ───────────────────────────────────
+  // ─ billing ────────────────────────────────────────────────────────────────
   {
     name: "susu_allowance",
     description:
-      "Read on-chain SPL allowance and rate. BETA returns {status:'BETA — free', rate:0}. Paid returns {allowance_usd, estimated_calls_remaining, spender_pubkey, approve_again_url}.",
+      "Read the user's billing status. BETA returns {status:'BETA — free', rate:0}. Paid returns the remaining balance + an approve URL if a top-up is needed.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
     name: "susu_approve_tx",
     description:
-      "Build an unsigned SPL Token Approve tx (base64). User must sign in their wallet (Phantom etc) and submit. Direct user to https://susurration.xyz/approve?amount=N for the signing flow.",
+      "Build a top-up transaction the user signs in their wallet. Direct them to https://susurration.xyz/approve?amount=N for the in-browser signing flow.",
     inputSchema: {
       type: "object",
       properties: { amount_usd: { type: "number", default: 100, minimum: 0.01, maximum: 10000 } },
@@ -290,18 +290,13 @@ const TOOLS = [
     },
   },
   {
-    name: "susu_spender",
-    description: "Public — return the current spender pubkey + USDC mint + cluster. Useful for verifying which key an Approve goes to.",
-    inputSchema: { type: "object", properties: {}, additionalProperties: false },
-  },
-  {
     name: "susu_usage",
-    description: "List recent debits (each push/react in paid mode). Returns total_calls, total_cost_usd, items.",
+    description: "List recent activity (push/react). Returns total count, total cost, and per-item rows.",
     inputSchema: {
       type: "object",
       properties: {
         limit: { type: "integer", minimum: 1, maximum: 1000, default: 20 },
-        since: { type: "string", description: "ISO 8601 timestamp; only return debits after this" },
+        since: { type: "string", description: "ISO 8601 timestamp; only return rows after this" },
       },
       additionalProperties: false,
     },
@@ -345,14 +340,12 @@ async function main() {
         // ─ friends ────────────────────────────────────────────────────────
         case "susu_friends_add":
           result = await api(cfg, "POST", "/friends/add", {
-            ...(args.username ? { username: String(args.username).replace(/^@/, "") } : {}),
-            ...(args.address ? { address: args.address } : {}),
+            username: String(args.username ?? "").replace(/^@/, ""),
           });
           break;
         case "susu_friends_accept":
           result = await api(cfg, "POST", "/friends/accept", {
-            ...(args.username ? { username: String(args.username).replace(/^@/, "") } : {}),
-            ...(args.address ? { address: args.address } : {}),
+            username: String(args.username ?? "").replace(/^@/, ""),
           });
           break;
         case "susu_friends_list": {
@@ -368,9 +361,14 @@ async function main() {
         case "susu_channel_create":
           result = await api(cfg, "POST", "/channels", { name: args.name ?? null });
           break;
-        case "susu_channel_invite":
-          result = await api(cfg, "POST", `/channels/${args.channel_id}/invite`, { address: args.address });
+        case "susu_channel_invite": {
+          // Resolve @handle → address (backend invite endpoint takes the
+          // raw identity primitive; we hide it from the agent surface).
+          const uname = String(args.username ?? "").replace(/^@/, "").toLowerCase();
+          const lookup = await api<{ address: string }>(cfg, "GET", `/identity/by-username/${uname}`, undefined, false);
+          result = await api(cfg, "POST", `/channels/${args.channel_id}/invite`, { address: lookup.address });
           break;
+        }
         case "susu_channel_members":
           result = await api(cfg, "GET", `/channels/${args.channel_id}/members`);
           break;
@@ -383,15 +381,20 @@ async function main() {
           break;
         }
         case "susu_channel_transfer_owner": {
-          const body: any = {};
-          if (args.username) body.username = String(args.username).replace(/^@/, "");
-          if (args.candidate_address) body.candidate_address = args.candidate_address;
-          result = await api(cfg, "POST", `/channels/${args.channel_id}/transfer-owner`, body);
+          // Backend transfer-owner takes either {username} or {candidate_address};
+          // here we only ever send {username} since the MCP tool surface only
+          // exposes @handles to the agent.
+          result = await api(cfg, "POST", `/channels/${args.channel_id}/transfer-owner`, {
+            username: String(args.username ?? "").replace(/^@/, ""),
+          });
           break;
         }
-        case "susu_channel_kick":
-          result = await api(cfg, "POST", `/channels/${args.channel_id}/kick`, { address: args.address });
+        case "susu_channel_kick": {
+          const uname = String(args.username ?? "").replace(/^@/, "").toLowerCase();
+          const lookup = await api<{ address: string }>(cfg, "GET", `/identity/by-username/${uname}`, undefined, false);
+          result = await api(cfg, "POST", `/channels/${args.channel_id}/kick`, { address: lookup.address });
           break;
+        }
 
         // ─ signals ────────────────────────────────────────────────────────
         case "susu_signal_push":
@@ -414,10 +417,6 @@ async function main() {
           break;
         case "susu_approve_tx":
           result = await api(cfg, "POST", "/billing/approve-tx", { amount_usd: args.amount_usd ?? 100 });
-          break;
-        case "susu_spender":
-          // Public endpoint — but include token if present (server doesn't care).
-          result = await api(cfg, "GET", "/billing/spender", undefined, false);
           break;
         case "susu_usage": {
           const qs = new URLSearchParams();
