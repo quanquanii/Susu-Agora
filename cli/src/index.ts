@@ -692,8 +692,7 @@ async function cmdAllowance(args: string[]): Promise<number> {
   return printJsonOrTable(args, out, (o) => {
     if (o.status === "BETA — free") {
       return (
-        `status:     BETA — free (every push and react is free)\n` +
-        `cluster:    ${o.cluster}\n` +
+        `status:  BETA — free (every push and react is free)\n` +
         `(when paid mode flips on, your first push will return 402 + an approve URL)\n`
       );
     }
