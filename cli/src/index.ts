@@ -251,17 +251,17 @@ async function cmdRegister(args: string[]): Promise<number> {
   if (!raw) { process.stderr.write("usage: susu register @handle [--yes]\n"); return 1; }
   const username = (raw.startsWith("@") ? raw.slice(1) : raw).toLowerCase();
 
-  // Client-side format check. Server enforces the same rule (5-20 chars,
-  // [a-z0-9_-]) plus the reserved-list gate; doing the format check here
-  // saves a round-trip when the user typos and gives immediate feedback.
-  // 3-4 char names are rare-reserved; format-valid here, server returns
-  // 409 with a hint to ask the operator for a grant.
-  const SELF_SERVE_RE = /^[a-z0-9_-]{5,20}$/;
-  if (!SELF_SERVE_RE.test(username)) {
+  // Client-side FORMAT check (not policy). Catches typos / wrong-case /
+  // too-long names before round-tripping. Length-policy (5-char self-serve
+  // floor) and reserved-list (system / rare / obscenity) live on the server
+  // because client doesn't know if the caller has been granted a 3-4 char
+  // rare name. Server returns 409 with category + reason when policy fails;
+  // client just stays out of policy enforcement.
+  const FORMAT_RE = /^[a-z0-9_-]{3,20}$/;
+  if (!FORMAT_RE.test(username)) {
     process.stderr.write(
       `invalid username "@${username}":\n` +
-      `  must be 5-20 chars, lowercase a-z 0-9 _ -\n` +
-      `  (3-4 char names are reserved; ask the operator to grant one)\n`,
+      `  must be 3-20 chars, lowercase a-z 0-9 _ -\n`,
     );
     return 1;
   }
