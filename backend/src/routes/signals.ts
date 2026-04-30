@@ -48,6 +48,10 @@ type SignalEvent = {
   signal_id: string;
   channel_id: string;
   from_address: string;
+  /** @handle of the sender if registered. Clients should prefer this for
+   *  display — `from_address` is a backend identity primitive users
+   *  shouldn't see in chat-like surfaces. */
+  from_username: string | null;
   payload: unknown;
   created_at: string;
 };
@@ -130,10 +134,17 @@ signalRoutes.post("/channels/:id/signals", async (c) => {
         signalId: row.signal_id,
         callType: "signal_push",
       });
+      // Look up the sender's @handle so SSE / batch consumers can render
+      // it directly. Cheap (single PK lookup); cached usernames hot-path.
+      const u = await tx<{ username: string | null }[]>`
+        SELECT username FROM identities WHERE address = ${me}
+      `;
+      const from_username = u[0]?.username ?? null;
       return {
         signal_id: row.signal_id,
         channel_id: channelId,
         from_address: me,
+        from_username,
         payload,
         created_at: row.created_at.toISOString(),
         cost_usd: meterOut.cost_usd,
@@ -144,6 +155,7 @@ signalRoutes.post("/channels/:id/signals", async (c) => {
       signal_id: result.signal_id,
       channel_id: channelId,
       from_address: me,
+      from_username: result.from_username,
       payload,
       created_at: result.created_at,
     });
@@ -174,18 +186,28 @@ signalRoutes.get("/channels/:id/signals", async (c) => {
   const since = c.req.query("since");
   const limit = Math.min(Math.max(Number(c.req.query("limit") ?? 50), 1), 200);
 
+  // JOIN identities so the CLI / agent can render @handle directly without
+  // doing a second lookup. The address column stays for protocol clients
+  // that care; UIs should prefer from_username and treat from_address as
+  // a backend identifier.
   const rows = since
     ? await sql<any[]>`
-        SELECT signal_id, channel_id, from_address, payload, created_at
-        FROM signals
-        WHERE channel_id = ${channelId} AND created_at > ${since}
-        ORDER BY created_at ASC LIMIT ${limit}
+        SELECT s.signal_id, s.channel_id, s.from_address,
+               i.username AS from_username,
+               s.payload, s.created_at
+        FROM signals s
+        LEFT JOIN identities i ON i.address = s.from_address
+        WHERE s.channel_id = ${channelId} AND s.created_at > ${since}
+        ORDER BY s.created_at ASC LIMIT ${limit}
       `
     : await sql<any[]>`
-        SELECT signal_id, channel_id, from_address, payload, created_at
-        FROM signals
-        WHERE channel_id = ${channelId}
-        ORDER BY created_at DESC LIMIT ${limit}
+        SELECT s.signal_id, s.channel_id, s.from_address,
+               i.username AS from_username,
+               s.payload, s.created_at
+        FROM signals s
+        LEFT JOIN identities i ON i.address = s.from_address
+        WHERE s.channel_id = ${channelId}
+        ORDER BY s.created_at DESC LIMIT ${limit}
       `;
   return c.json({ signals: rows });
 });

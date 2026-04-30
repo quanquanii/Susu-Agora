@@ -152,8 +152,12 @@ async function cmdInit(args: string[]): Promise<number> {
   delete cfg.token;
   delete cfg.token_expires_at;
   await saveConfig(cfg);
-  process.stdout.write(`address: ${keys.address}\nconfig:  ${CONFIG_PATH}\n`);
-  process.stdout.write(`next:    susu login\n`);
+  // Don't print the address. It's the user's Solana pubkey — a backend
+  // identity mechanism (signature verification anchor + future USDC
+  // payment target). Users only need to know about their @handle. The
+  // address is in ~/.susu/config.json if they ever genuinely need it.
+  process.stdout.write(`keypair stored at ${CONFIG_PATH}\n`);
+  process.stdout.write(`next: susu login\n`);
   // Agent-native nudge: if a human is running this, they likely have an AI
   // agent on the side. Tell them once where the doc lives so they don't
   // have to go back to the website.
@@ -190,7 +194,12 @@ async function cmdLogin(_args: string[]): Promise<number> {
   cfg.token = verify.token;
   cfg.token_expires_at = verify.expires_at;
   await saveConfig(cfg);
-  process.stdout.write(`logged in as ${verify.address}\nsession expires ${verify.expires_at}\n`);
+  // Don't echo the address; if the user has a handle we already showed
+  // it on register. For first login (pre-register) just confirm success.
+  process.stdout.write(`logged in. session expires ${verify.expires_at}\n`);
+  if (!cfg.handle) {
+    process.stdout.write(`next: susu register @your-handle\n`);
+  }
   return 0;
 }
 
@@ -198,8 +207,10 @@ async function cmdWhoami(args: string[]): Promise<number> {
   const cfg = await loadConfig();
   if (!cfg.token) { process.stderr.write("not logged in (run `susu login`)\n"); return 2; }
   const me = await api<any>(cfg, "/identity/whoami");
+  // Default human view: just the @handle. Address is a backend identity
+  // primitive — users don't think in terms of pubkeys. `--json` keeps the
+  // full record (including address) for debug / agent-script use.
   return printJsonOrTable(args, me, (m: any) =>
-    `address:             ${m.address}\n` +
     `username:            ${m.username ? "@" + m.username : "(unset — run `susu register @handle`)"}\n` +
     `auto_accept_friends: ${m.auto_accept_friends ?? true}\n`,
   );
@@ -280,8 +291,8 @@ async function cmdRegister(args: string[]): Promise<number> {
     }
     process.stderr.write(
       `\nYou're about to lock @${username} as your PERMANENT username.\n` +
-      `This cannot be changed later. The address it's bound to is:\n` +
-      `  ${cfg.address}\n\n` +
+      `This cannot be changed later — the only way to get a different\n` +
+      `handle would be to start over with a fresh keypair.\n\n` +
       `Type "yes" to confirm: `,
     );
     const answer = await readLineFromStdin();
@@ -297,7 +308,7 @@ async function cmdRegister(args: string[]): Promise<number> {
   cfg.handle = out.username;
   await saveConfig(cfg);
   return printJsonOrTable(args, out, (o) =>
-    `registered: ${fmtHandle(o.username)}\naddress:    ${o.address}\n` +
+    `registered: ${fmtHandle(o.username)}\n` +
     `(usernames are permanent and immutable)\n`,
   );
 }
@@ -383,17 +394,15 @@ async function cmdFriends(args: string[]): Promise<number> {
     process.stdout.write(JSON.stringify({ ...friends, ...requests }, null, 2) + "\n");
     return 0;
   }
+  // Show only @handles. Address + channel_id + request_id are backend
+  // identifiers — users navigate purely via @handle.
   const fLines = friends.friends.length === 0
     ? "  (none)"
-    : friends.friends.map((f: any) =>
-        `  ${(fmtHandle(f.friend_username)).padEnd(22)}  ${f.friend_address.slice(0, 6)}…  channel=${f.channel_id.slice(0, 8)}…`,
-      ).join("\n");
+    : friends.friends.map((f: any) => `  ${fmtHandle(f.friend_username)}`).join("\n");
   const rLines = requests.requests.length === 0
     ? ""
     : `\npending incoming requests:\n` +
-      requests.requests.map((r: any) =>
-        `  ${(fmtHandle(r.from_username)).padEnd(22)}  ${r.from_addr.slice(0, 6)}…  request_id=${r.request_id.slice(0, 8)}…`,
-      ).join("\n") + "\n";
+      requests.requests.map((r: any) => `  ${fmtHandle(r.from_username)}`).join("\n") + "\n";
   process.stdout.write(`friends:\n${fLines}\n${rLines}`);
   return 0;
 }
@@ -437,7 +446,7 @@ async function cmdGroup(args: string[]): Promise<number> {
     const out = await api<{ members: any[] }>(cfg, `/channels/${id}/members`);
     return printJsonOrTable(rest, out, (o) =>
       o.members.map((m: any) =>
-        `  ${fmtHandle(m.username).padEnd(22)}  ${m.address.slice(0, 6)}…  joined=${m.joined_at}`,
+        `  ${fmtHandle(m.username).padEnd(22)}  joined=${m.joined_at}`,
       ).join("\n") + "\n",
     );
   }
@@ -622,7 +631,10 @@ async function cmdSignals(args: string[]): Promise<number> {
   const id = await resolveTargetChannel(cfg, target);
   const out = await api<{ signals: any[] }>(cfg, `/channels/${id}/signals?limit=50`);
   return printJsonOrTable(args, out, (o) =>
-    o.signals.map((s: any) => `${s.created_at}  ${s.from_address.slice(0, 8)}…  ${JSON.stringify(s.payload)}`).join("\n") + "\n",
+    o.signals.map((s: any) => {
+      const who = s.from_username ? `@${s.from_username}` : "(unregistered)";
+      return `${s.created_at}  ${who.padEnd(20)}  ${JSON.stringify(s.payload)}`;
+    }).join("\n") + "\n",
   );
 }
 
@@ -662,7 +674,8 @@ async function cmdWatch(args: string[]): Promise<number> {
       if (event === "signal" && data) {
         try {
           const e = JSON.parse(data);
-          process.stdout.write(`${e.created_at}  ${e.from_address.slice(0, 8)}…  ${JSON.stringify(e.payload)}\n`);
+          const who = e.from_username ? `@${e.from_username}` : "(unregistered)";
+          process.stdout.write(`${e.created_at}  ${who.padEnd(20)}  ${JSON.stringify(e.payload)}\n`);
         } catch { process.stdout.write(data + "\n"); }
       }
     }
@@ -679,23 +692,18 @@ async function cmdAllowance(args: string[]): Promise<number> {
   return printJsonOrTable(args, out, (o) => {
     if (o.status === "BETA — free") {
       return (
-        `address:    ${o.address}\n` +
         `status:     BETA — free (every push and react is free)\n` +
         `cluster:    ${o.cluster}\n` +
-        `usdc_mint:  ${o.usdc_mint}\n` +
         `(when paid mode flips on, your first push will return 402 + an approve URL)\n`
       );
     }
     return (
-      `address:           ${o.address}\n` +
-      `status:            paid\n` +
-      `rate_per_call:     $${o.rate_usd_per_call}\n` +
-      `allowance_usd:     $${Number(o.allowance_usd ?? 0).toFixed(4)}\n` +
-      `calls_remaining:   ${o.estimated_calls_remaining ?? "?"}\n` +
-      `spender_pubkey:    ${o.spender_pubkey ?? "(unavailable)"}\n` +
-      `cluster:           ${o.cluster}\n` +
-      `usdc_mint:         ${o.usdc_mint}\n` +
-      `\nApprove top-up:    ${o.approve_again_url}\n` +
+      `status:          paid\n` +
+      `rate_per_call:   $${o.rate_usd_per_call}\n` +
+      `allowance_usd:   $${Number(o.allowance_usd ?? 0).toFixed(4)}\n` +
+      `calls_remaining: ${o.estimated_calls_remaining ?? "?"}\n` +
+      `cluster:         ${o.cluster}\n` +
+      `\nApprove top-up:  ${o.approve_again_url}\n` +
       `(or run: susu approve [<amount_usd>])\n`
     );
   });
@@ -752,16 +760,18 @@ async function cmdUsage(args: string[]): Promise<number> {
 
 async function cmdConfig(args: string[]): Promise<number> {
   const cfg = await loadConfig();
-  // Hide the secret unless explicitly requested.
-  const safe = { ...cfg, secret_key_b58: cfg.secret_key_b58 ? "(redacted)" : undefined };
+  // Default human view: just what the user actually controls (api_url,
+  // their @handle, session state). The keypair is internal — visible only
+  // via --json (which also redacts the private key).
+  const safe = {
+    ...cfg,
+    secret_key_b58: cfg.secret_key_b58 ? "(redacted)" : undefined,
+  };
   return printJsonOrTable(args, safe, (s: any) =>
-    `api_url:   ${s.api_url}\n` +
-    `address:   ${s.address ?? "(none)"}\n` +
-    `handle:    ${s.handle ?? "(none)"}\n` +
-    `token:     ${s.token ? "set" : "(none)"}\n` +
-    `expires:   ${s.token_expires_at ?? "(n/a)"}\n` +
-    `path:      ${CONFIG_PATH}\n` +
-    `dir:       ${configDir()}\n`,
+    `api_url:  ${s.api_url}\n` +
+    `handle:   ${s.handle ? "@" + s.handle : "(unregistered)"}\n` +
+    `session:  ${s.token ? `active until ${s.token_expires_at}` : "(none — run `susu login`)"}\n` +
+    `path:     ${CONFIG_PATH}\n`,
   );
 }
 
