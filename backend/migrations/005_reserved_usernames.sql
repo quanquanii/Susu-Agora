@@ -151,3 +151,5 @@ INSERT INTO reserved_usernames(username, category, reason) VALUES
   ('scammer',  'obscenity', 'reserved word'),
   ('rugpull',  'obscenity', 'reserved word'),
   ('rugged',   'obscenity', 'reserved word');
+
+INSERT INTO schema_migrations(version) VALUES ('005_reserved_usernames');
