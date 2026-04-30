@@ -1,0 +1,98 @@
+# fly.toml — Susurration single-image deploy (backend serves API + SPA).
+#
+# Source-of-truth for all NON-secret env. Secrets (admin token, events hash
+# salt, hot-wallet keypair path content) are set via `fly secrets set ...`
+# and live only in fly's encrypted store, never in this file.
+#
+# After editing this file: `fly deploy` from this directory.
+
+app = "susurration"
+primary_region = "sin"
+
+# ───── build ────────────────────────────────────────────────────────────
+[build]
+  # Uses ./Dockerfile in this directory.
+
+# ───── runtime env (non-secret) ─────────────────────────────────────────
+[env]
+  PORT = "8080"
+
+  # Single-hostname web + API. Backend serves the SPA from /app/web/dist.
+  # The Dockerfile sets these too; declaring here makes them visible via
+  # `fly secrets list` for sanity checking.
+  SUSU_SERVE_WEB = "1"
+  SUSU_WEB_ROOT = "/app/web/dist"
+
+  # BETA period: rate=0 means push & react are FREE; allowance/spender
+  # endpoints return BETA shape. To flip to paid mode (post-launch
+  # calibration): `fly secrets set BILLING_RATE_USD=1` (or change here +
+  # redeploy). The cluster will need to flip in the same release — see
+  # Cluster section below.
+  BILLING_RATE_USD = "0"
+
+  # Cluster / chain config. BETA stays on devnet (no real USDC at risk).
+  # Paid-mode flip → set both of these to mainnet values in the same deploy.
+  SOLANA_CLUSTER = "devnet"
+  SOLANA_RPC_URL = "https://api.devnet.solana.com"
+  # USDC mint defaults to devnet's automatically (config.ts), but we pin
+  # explicitly so a misconfigured cluster never silently uses the wrong mint.
+  SUSU_USDC_MINT = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
+
+  # Spender (hot-wallet) keypair path. Lives on the persistent volume
+  # mounted at /data so a machine restart keeps the same delegate. First
+  # request to /billing/spender on devnet auto-generates the file (rate=0
+  # means it's never actually used to sign txs during BETA, but persisting
+  # it lets paid-mode flip happen with no migration of stored grants).
+  # Paid-mode mainnet: REPLACE this file via `fly ssh sftp` with a real
+  # production keypair before flipping cluster.
+  SUSU_HOT_WALLET_KEYPAIR = "/data/susu/hot-wallet.json"
+
+  # CORS — only susurration.xyz needs to call the API in prod.
+  ALLOWED_ORIGINS = "https://susurration.xyz"
+
+# ───── persistent volume ────────────────────────────────────────────────
+# Holds the spender keypair file across machine restarts. 1GB is overkill
+# for a single JSON file, but 1GB is the minimum and free tier covers it.
+[mounts]
+  source = "susu_data"
+  destination = "/data"
+
+# ───── deploy hook ──────────────────────────────────────────────────────
+# Runs once per release before the new app boots. Applies any pending DB
+# migrations (idempotent — `bun run src/migrate.ts` no-ops if up to date).
+[deploy]
+  release_command = "bun run src/migrate.ts"
+
+# ───── HTTP edge ────────────────────────────────────────────────────────
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Suspend (not stop) means cold-start is ~150ms instead of ~3s. Free tier.
+  auto_stop_machines = "suspend"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 200
+    hard_limit = 250
+
+# ───── health check ─────────────────────────────────────────────────────
+# Hits /health which returns DB readiness + live SSE stats. 30s interval +
+# 5s timeout gives fly enough breathing room to not flap on slow Postgres.
+[[http_service.checks]]
+  grace_period = "10s"
+  interval = "30s"
+  method = "get"
+  path = "/health"
+  timeout = "5s"
+
+# ───── VM size ──────────────────────────────────────────────────────────
+# 512MB shared CPU is plenty for BETA. Backend is single-process Bun + Hono
+# in-memory pubsub for SSE. Bump to 1GB if memory pressure shows up in
+# `fly metrics`.
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
