@@ -10,6 +10,7 @@ import nacl from "tweetnacl";
 import bs58 from "bs58";
 import { sql } from "./db.ts";
 import { config } from "./config.ts";
+import { recordEvent } from "./lib/events.ts";
 
 export class AuthError extends Error {
   constructor(public status: number, public reason: string) {
@@ -110,6 +111,10 @@ export async function verifySignatureAndIssueSession(args: {
       VALUES (${token}, ${address}, ${expiresAt})
     `;
   });
+
+  // BETA telemetry: top-of-funnel signal. Funnel query in admin/funnel
+  // looks for 'auth_signin' to compute signin → register → push conversion.
+  recordEvent({ type: "auth_signin", address });
 
   return { token, expires_at: expiresAt.toISOString(), address };
 }

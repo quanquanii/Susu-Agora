@@ -6,6 +6,7 @@ import {
 } from "../auth.ts";
 import { parseJsonBody, invalidJson } from "../lib/http.ts";
 import { check as rateCheck, RateLimitedError } from "../lib/rate_limit.ts";
+import { recordEvent } from "../lib/events.ts";
 
 export const identityRoutes = new Hono();
 
@@ -165,6 +166,11 @@ identityRoutes.post("/identity/register", async (c) => {
     }
     throw e;
   }
+
+  // BETA telemetry: register is the second funnel stage. Don't include the
+  // username in the payload — it's PII (the whole point of `events` is to
+  // be join-able by hashed address but not reverse-resolvable).
+  recordEvent({ type: "register", address: me });
 
   return c.json({ address: me, username });
 });
