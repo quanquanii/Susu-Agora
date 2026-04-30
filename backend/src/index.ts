@@ -189,7 +189,29 @@ api.route("/", adminRoutes);
 // G7 P0 #1 follow-up: any unmatched /api/* must return JSON 404, NOT fall
 // through to the SPA fallback below (which would return index.html and
 // confuse API clients into thinking they hit a working endpoint).
-api.all("*", (c) => c.json({ error: "not_found" }, 404));
+//
+// Method-aware 405: when a debugger / new operator hits a POST-only
+// endpoint with GET (common confusion), return 405 method_not_allowed
+// instead of a misleading 404 not_found. We don't aim for full coverage
+// (Hono doesn't expose "this path exists for another method" out of the
+// box) — just the endpoints most likely to be hand-poked.
+const POST_ONLY_API_PATTERNS: RegExp[] = [
+  /^\/auth\/(nonce|verify|stream-token)$/,
+  /^\/identity\/register$/,
+  /^\/friends\/(add|accept|remove)$/,
+  /^\/billing\/approve-tx$/,
+];
+api.all("*", (c) => {
+  if (c.req.method !== "POST") {
+    // Strip the /api prefix the router was mounted under so the patterns
+    // above can match the un-prefixed paths.
+    const path = c.req.path.replace(/^\/api/, "");
+    if (POST_ONLY_API_PATTERNS.some((p) => p.test(path))) {
+      return c.json({ error: "method_not_allowed", allow: "POST" }, 405);
+    }
+  }
+  return c.json({ error: "not_found" }, 404);
+});
 app.route("/api", api);
 
 // Static web (web/dist after `bun build`). Hono's serveStatic ships dist as /

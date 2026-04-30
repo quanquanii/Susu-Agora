@@ -249,7 +249,22 @@ async function cmdRegister(args: string[]): Promise<number> {
   if (!cfg.token) { process.stderr.write("not logged in (run `susu login`)\n"); return 2; }
   const raw = args[0];
   if (!raw) { process.stderr.write("usage: susu register @handle [--yes]\n"); return 1; }
-  const username = raw.startsWith("@") ? raw.slice(1) : raw;
+  const username = (raw.startsWith("@") ? raw.slice(1) : raw).toLowerCase();
+
+  // Client-side format check. Server enforces the same rule (5-20 chars,
+  // [a-z0-9_-]) plus the reserved-list gate; doing the format check here
+  // saves a round-trip when the user typos and gives immediate feedback.
+  // 3-4 char names are rare-reserved; format-valid here, server returns
+  // 409 with a hint to ask the operator for a grant.
+  const SELF_SERVE_RE = /^[a-z0-9_-]{5,20}$/;
+  if (!SELF_SERVE_RE.test(username)) {
+    process.stderr.write(
+      `invalid username "@${username}":\n` +
+      `  must be 5-20 chars, lowercase a-z 0-9 _ -\n` +
+      `  (3-4 char names are reserved; ask the operator to grant one)\n`,
+    );
+    return 1;
+  }
 
   // Two-step confirmation. Username is permanent and immutable; the only
   // "second chance" is for an admin to grant the user a fresh rare name
