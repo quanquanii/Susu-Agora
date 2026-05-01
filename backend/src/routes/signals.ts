@@ -358,9 +358,14 @@ signalRoutes.get("/channels/:id/signals/stream", async (c) => {
       wakeWaiter();
     });
 
+    // Heartbeat: 10s. Some intermediaries (browser proxies, mobile carrier
+    // NATs, fly.io edge) drop idle conns at <30s windows. 25s left a thin
+    // margin and we observed `error: terminated` on the client without any
+    // server-side reason — tightening to 10s removes that ambiguity. Pings
+    // are 14 bytes; cost is negligible. (BETA-1.b post-mortem)
     const heartbeat = setInterval(() => {
       stream.writeSSE({ event: "ping", data: String(Date.now()) }).catch(() => {});
-    }, 25_000);
+    }, 10_000);
 
     stream.onAbort(() => {
       aborted = true;
@@ -391,6 +396,14 @@ signalRoutes.get("/channels/:id/signals/stream", async (c) => {
       if (ejected) {
         await stream.writeSSE({ event: "ejected", data: JSON.stringify(ejected) }).catch(() => {});
       }
+    } catch (err) {
+      // BETA-1.b: surface the actual cause of stream death so we can tell
+      // "client TCP died" from "we wrote to a closed socket" from "DB blew
+      // up". Previously this fell silently into finally{} and the client
+      // saw a bare `error: terminated` with no server-side breadcrumb.
+      console.warn(
+        `[sse:channel] stream broken channel=${channelId} addr=${me}: ${(err as Error)?.message ?? err}`,
+      );
     } finally {
       aborted = true;
       clearInterval(heartbeat);
@@ -593,9 +606,14 @@ signalRoutes.get("/signals/feed/stream", async (c) => {
       }));
     }
 
+    // Heartbeat: 10s. Some intermediaries (browser proxies, mobile carrier
+    // NATs, fly.io edge) drop idle conns at <30s windows. 25s left a thin
+    // margin and we observed `error: terminated` on the client without any
+    // server-side reason — tightening to 10s removes that ambiguity. Pings
+    // are 14 bytes; cost is negligible. (BETA-1.b post-mortem)
     const heartbeat = setInterval(() => {
       stream.writeSSE({ event: "ping", data: String(Date.now()) }).catch(() => {});
-    }, 25_000);
+    }, 10_000);
 
     stream.onAbort(() => {
       aborted = true;
@@ -628,6 +646,11 @@ signalRoutes.get("/signals/feed/stream", async (c) => {
           });
         }
       }
+    } catch (err) {
+      // BETA-1.b: surface stream death cause; see channel handler for rationale.
+      console.warn(
+        `[sse:feed] stream broken addr=${me}: ${(err as Error)?.message ?? err}`,
+      );
     } finally {
       aborted = true;
       clearInterval(heartbeat);
