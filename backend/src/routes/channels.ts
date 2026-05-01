@@ -25,6 +25,7 @@ import {
 import { parseJsonBody, invalidJson } from "../lib/http.ts";
 import { check as rateCheck, RateLimitedError } from "../lib/rate_limit.ts";
 import { recordEvent } from "../lib/events.ts";
+import { ejectAddressFromChannel } from "./signals.ts";
 
 const MAX_CHANNELS_PER_ADDRESS = 5;
 const INVITE_PER_ADDR = { windowMs: 60_000, max: 30 };
@@ -219,6 +220,12 @@ channelRoutes.post("/channels/:id/leave", async (c) => {
   if (!result.was_1on1 && result.ownerHandover) {
     recordEvent({ type: "owner_auto_elected", address: me, channelId, payload: { handed_to_hash: undefined /* avoid extra hashing inside lib */ } });
   }
+  // Close any active SSE subscription `me` has on this channel. For 1-on-1
+  // we also need to close the counterpart's subscription because the channel
+  // no longer exists (CASCADE deleted), but we don't know the counterpart's
+  // address here cheaply — they'll see their next push fail with 404 and
+  // their existing SSE will idle until heartbeat-write-fail. (G v0.0.4 #2)
+  ejectAddressFromChannel(channelId, me, "left");
   recordEvent({ type: "channel_leave", address: me, channelId, payload: { was_1on1: result.was_1on1 } });
   return c.json({ ok: true, ...result });
 });
@@ -260,6 +267,10 @@ channelRoutes.post("/channels/:id/kick", async (c) => {
     if (e instanceof HttpError) return c.json({ error: e.reason }, e.status as 400 | 403 | 404 | 409);
     throw e;
   }
+  // Close any active SSE subscription that the kicked user has on THIS
+  // channel. Without this, their open `susu watch` / `susu feed -f` keeps
+  // streaming new messages — real data leak (G v0.0.4 review #2).
+  ejectAddressFromChannel(channelId, target, "kicked");
   recordEvent({ type: "channel_kick", address: me, channelId });
   return c.json({ ok: true, kicked: target });
 });

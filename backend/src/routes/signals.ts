@@ -18,6 +18,7 @@ import { HttpError } from "./channels.ts";
 import { check as rateCheck, RateLimitedError } from "../lib/rate_limit.ts";
 import { recordEvent } from "../lib/events.ts";
 import { buildAllowanceResponse } from "./billing.ts";
+import { stripControlCharsDeep } from "../../../shared/strip-control.ts";
 
 const APPROVE_AGAIN_URL = "https://susurration.xyz/approve?amount=100";
 
@@ -30,10 +31,46 @@ function insufficientAllowance(c: any, e: InsufficientAllowanceError) {
   }, 402);
 }
 
+// S5: feed bootstrap can return up to 200 rows. With body-limit 64KB per
+// push, an attacker pushing max-size payloads could make a single feed
+// response 200 × 64KB = 12.8MB — bad for terminal renderers, mobile, slow
+// links. Truncate per-row payload at PAYLOAD_RENDER_CAP and replace with
+// {truncated:true, size_bytes:N, preview} so the client can decide whether
+// to fetch the full thing via /channels/.../signals?since=... .
+// Storage is unaffected — we still keep the original. (G v0.0.4 review 🟡 #3)
+const PAYLOAD_RENDER_CAP = 4096;
+function truncatePayloadForFeed(p: unknown): unknown {
+  let raw: string;
+  try { raw = JSON.stringify(p); } catch { return { truncated: true, reason: "unserializable" }; }
+  if (raw.length <= PAYLOAD_RENDER_CAP) return p;
+  // For text-shaped payloads, surface a readable preview; otherwise just
+  // tell the client there's more.
+  const preview = typeof p === "object" && p !== null && typeof (p as any).text === "string"
+    ? (p as any).text.slice(0, 256)
+    : raw.slice(0, 256);
+  return {
+    truncated: true,
+    size_bytes: raw.length,
+    preview,
+    fetch_via: "GET /channels/{channel_id}/signals?since=...",
+  };
+}
+
 // BETA-1.b: anti-flood. Push at most 30/min/address (~1 every 2s sustained) —
 // a real trader pushes a few signals per hour; bots get throttled fast.
 const PUSH_PER_ADDR = { windowMs: 60_000, max: 30 };
 const REACT_PER_ADDR = { windowMs: 60_000, max: 60 };
+// Read-side limits — `susu feed` / `susu inbox` are interactive UIs, real
+// users hit this maybe 10×/min while glancing. 60/min is generous for legit
+// inbox refreshes + still chokes a "spam GET to exhaust Postgres JOINs"
+// attacker (G v0.0.4 review #3).
+const FEED_PER_ADDR = { windowMs: 60_000, max: 60 };
+// G v0.0.4 review #1: per-user concurrent SSE cap. Each connection pins a
+// pubsub subscription + an HTTP fd; with no cap a single token could open
+// thousands. 5 covers the realistic case (1 inbox + 1 watch + reconnect
+// during a flap). Excess attempts get HTTP 429 immediately.
+const MAX_SSE_PER_ADDR = 5;
+const sseConnByAddr = new Map<string, number>();
 
 function rateLimited(c: any, e: RateLimitedError) {
   c.header("Retry-After", String(e.retryAfterSec));
@@ -55,7 +92,15 @@ type SignalEvent = {
   payload: unknown;
   created_at: string;
 };
-const subscribers = new Map<string, Set<(e: SignalEvent) => void>>();
+// Sentinel pushed via the same fn() to signal "you've been ejected from the
+// channel, abort the SSE stream now". Distinguished from SignalEvent by the
+// __close field. (G v0.0.4 review #2)
+type EjectEvent = { __close: true; reason: string };
+type Subscriber = {
+  address: string;
+  fn: (e: SignalEvent | EjectEvent) => void;
+};
+const subscribers = new Map<string, Set<Subscriber>>();
 
 /** Live SSE subscriber counts. /health uses this. */
 export function sseStats(): { channels: number; subscribers: number } {
@@ -67,22 +112,58 @@ export function sseStats(): { channels: number; subscribers: number } {
 function publish(channelId: string, evt: SignalEvent) {
   const subs = subscribers.get(channelId);
   if (!subs) return;
-  for (const fn of subs) {
-    try { fn(evt); } catch { /* never let one slow consumer break others */ }
+  for (const s of subs) {
+    try { s.fn(evt); } catch { /* never let one slow consumer break others */ }
   }
 }
 
-function subscribe(channelId: string, fn: (e: SignalEvent) => void) {
+function subscribe(
+  channelId: string,
+  address: string,
+  fn: (e: SignalEvent | EjectEvent) => void,
+): () => void {
   let subs = subscribers.get(channelId);
   if (!subs) {
     subs = new Set();
     subscribers.set(channelId, subs);
   }
-  subs.add(fn);
+  const entry: Subscriber = { address, fn };
+  subs.add(entry);
   return () => {
-    subs!.delete(fn);
+    subs!.delete(entry);
     if (subs!.size === 0) subscribers.delete(channelId);
   };
+}
+
+/** Externally close all SSE subscriptions for `address` on `channelId`.
+ *  Called when membership changes (kick / leave / 1on1 delete) so that
+ *  ex-members stop receiving new events. Without this, a kicked user's
+ *  open SSE connection keeps streaming new messages — real data leak
+ *  per G v0.0.4 review #2. */
+export function ejectAddressFromChannel(channelId: string, address: string, reason: string) {
+  const subs = subscribers.get(channelId);
+  if (!subs) return;
+  for (const s of [...subs]) {
+    if (s.address === address) {
+      try { s.fn({ __close: true, reason }); } catch {}
+      subs.delete(s);
+    }
+  }
+  if (subs.size === 0) subscribers.delete(channelId);
+}
+
+/** Eject `address` from EVERY channel they're subscribed to. Use when the
+ *  user's account is fully wiped (future: `susu logout --hard` / soft delete). */
+export function ejectAddressEverywhere(address: string, reason: string) {
+  for (const [channelId, subs] of subscribers) {
+    for (const s of [...subs]) {
+      if (s.address === address) {
+        try { s.fn({ __close: true, reason }); } catch {}
+        subs.delete(s);
+      }
+    }
+    if (subs.size === 0) subscribers.delete(channelId);
+  }
 }
 
 async function withAuth(c: any) { return await authedAddress(c.req.header("authorization")); }
@@ -113,10 +194,17 @@ signalRoutes.post("/channels/:id/signals", async (c) => {
   }
   // payload is the entire body — wrapped or unwrapped doesn't matter, we store as-is.
   // Common pattern: client sends {payload: {...}} OR {...} directly. Accept both.
-  const payload =
+  const rawPayload =
     typeof body === "object" && body !== null && "payload" in (body as any)
       ? (body as any).payload
       : body;
+  // S5: strip ANSI escapes / C0+C1 control chars from every string in the
+  // payload before persistence. This is defense-in-depth — terminal-rendering
+  // clients (susu feed/watch/inbox) also strip on render. See
+  // shared/strip-control.ts for what's stripped vs preserved (\n and \t are
+  // kept). Without this, any agent could forge [HUMAN] tags or clear user
+  // terminals via raw ANSI in payload text. (G v0.0.4 review #1)
+  const payload = stripControlCharsDeep(rawPayload);
 
   try {
     const result = await sql.begin(async (tx) => {
@@ -235,6 +323,15 @@ signalRoutes.get("/channels/:id/signals/stream", async (c) => {
   const channelId = c.req.param("id");
   if (!(await isMember(sql, channelId, me))) return c.json({ error: "not a member" }, 403);
 
+  // S5: per-user concurrent SSE cap. Each connection pins fd + pubsub sub;
+  // without a cap one token could open thousands. (G v0.0.4 review 🟡 #1)
+  const currentConnCount = sseConnByAddr.get(me) ?? 0;
+  if (currentConnCount >= MAX_SSE_PER_ADDR) {
+    c.header("Retry-After", "10");
+    return c.json({ error: "too_many_streams", limit: MAX_SSE_PER_ADDR }, 429);
+  }
+  sseConnByAddr.set(me, currentConnCount + 1);
+
   return streamSSE(c, async (stream) => {
     // R1 fix: track abort so the wait-for-event promise can be woken,
     // letting the loop's finally{} run (was leaking ~1 frame per disconnect).
@@ -249,8 +346,15 @@ signalRoutes.get("/channels/:id/signals/stream", async (c) => {
       r?.();
     }
 
-    unsub = subscribe(channelId, (evt) => {
-      queue.push(evt);
+    let ejected: { reason: string } | null = null;
+    unsub = subscribe(channelId, me, (evt) => {
+      if ((evt as EjectEvent).__close) {
+        ejected = { reason: (evt as EjectEvent).reason };
+        aborted = true;
+        wakeWaiter();
+        return;
+      }
+      queue.push(evt as SignalEvent);
       wakeWaiter();
     });
 
@@ -282,11 +386,255 @@ signalRoutes.get("/channels/:id/signals/stream", async (c) => {
           });
         }
       }
+      // If we were ejected (kicked / left), tell the client cleanly before
+      // the SSE closes so they don't auto-reconnect into an empty channel.
+      if (ejected) {
+        await stream.writeSSE({ event: "ejected", data: JSON.stringify(ejected) }).catch(() => {});
+      }
     } finally {
       aborted = true;
       clearInterval(heartbeat);
       unsub();
+      // S5: drop the per-address SSE counter we incremented at the top.
+      const c2 = (sseConnByAddr.get(me) ?? 1) - 1;
+      if (c2 <= 0) sseConnByAddr.delete(me); else sseConnByAddr.set(me, c2);
       // queue.length=0; the closure goes out of scope, GC reclaims everything.
+    }
+  });
+});
+
+// GET /signals/feed?since=ISO&limit=N — cross-channel history.
+//
+// Returns the caller's most recent signals across every channel they're a
+// member of, ordered by created_at DESC (most recent first). Used by:
+//   - human-side `susu feed` (terminal log of all my agent's chatter)
+//   - human-side `susu inbox` (bubble-UI window initial bootstrap)
+//   - agent-side `susu_signals_feed` MCP tool (catch up on inbox in one call)
+//
+// Channel labels are computed in SQL: 1-on-1 → peer's @handle (or truncated
+// address fallback), group → channel.name (or short channel_id). This means
+// the client doesn't need to do per-channel friend lookups.
+signalRoutes.get("/signals/feed", async (c) => {
+  let me: string;
+  try { me = await withAuth(c); } catch (e) { return authError(c, e); }
+
+  // S5: feed rate limit — read-side; protects DB from spam GET (G #3).
+  try { rateCheck(`feed:${me}`, FEED_PER_ADDR); }
+  catch (e) { if (e instanceof RateLimitedError) return rateLimited(c, e); throw e; }
+
+  // R3: input validation — bad query string should return 400, not crash to
+  // 500 via SQL parse errors. Number("abc")=NaN, Math.min(NaN,...)=NaN, and
+  // LIMIT NaN throws. since='garbage'::timestamptz throws. Both = client bug.
+  const rawLimit = c.req.query("limit");
+  const limitN = rawLimit === undefined ? 50 : Number(rawLimit);
+  if (!Number.isFinite(limitN)) {
+    return c.json({ error: "invalid_limit", detail: "limit must be a finite number" }, 400);
+  }
+  const limit = Math.min(Math.max(Math.trunc(limitN), 1), 200);
+
+  const since = c.req.query("since");
+  if (since !== undefined) {
+    const t = Date.parse(since);
+    if (!Number.isFinite(t)) {
+      return c.json({ error: "invalid_since", detail: "since must be ISO 8601" }, 400);
+    }
+  }
+
+  // Both branches return DESC order (newest first). Clients that want a
+  // chrono "tail -f" view reverse client-side; clients that want "newest
+  // first" (e.g. inbox bootstrap displaying top-of-list) consume as-is.
+  // Keeping ORDER consistent across `since` / no-`since` so client logic
+  // is the same for both. (G review #1)
+  const rows = since
+    ? await sql<any[]>`
+        SELECT s.signal_id,
+               s.channel_id,
+               s.from_address,
+               i.username AS from_username,
+               s.payload,
+               s.created_at,
+               c.name AS channel_name,
+               (
+                 SELECT json_build_object(
+                   'address', cm2.address,
+                   'username', i2.username
+                 )
+                 FROM channel_members cm2
+                 LEFT JOIN identities i2 ON i2.address = cm2.address
+                 WHERE cm2.channel_id = s.channel_id AND cm2.address <> ${me}
+                 LIMIT 1
+               ) AS peer
+        FROM signals s
+        JOIN channel_members cm ON cm.channel_id = s.channel_id AND cm.address = ${me}
+        JOIN channels c ON c.channel_id = s.channel_id
+        LEFT JOIN identities i ON i.address = s.from_address
+        WHERE s.created_at > ${since}
+        ORDER BY s.created_at DESC LIMIT ${limit}
+      `
+    : await sql<any[]>`
+        SELECT s.signal_id,
+               s.channel_id,
+               s.from_address,
+               i.username AS from_username,
+               s.payload,
+               s.created_at,
+               c.name AS channel_name,
+               (
+                 SELECT json_build_object(
+                   'address', cm2.address,
+                   'username', i2.username
+                 )
+                 FROM channel_members cm2
+                 LEFT JOIN identities i2 ON i2.address = cm2.address
+                 WHERE cm2.channel_id = s.channel_id AND cm2.address <> ${me}
+                 LIMIT 1
+               ) AS peer
+        FROM signals s
+        JOIN channel_members cm ON cm.channel_id = s.channel_id AND cm.address = ${me}
+        JOIN channels c ON c.channel_id = s.channel_id
+        LEFT JOIN identities i ON i.address = s.from_address
+        ORDER BY s.created_at DESC LIMIT ${limit}
+      `;
+  // S5: cap each row's payload so feed bootstrap stays bounded even if
+  // a malicious peer pushed 64KB messages. Original stays in DB; clients
+  // wanting the full row can fetch via /channels/{id}/signals.
+  for (const r of rows) r.payload = truncatePayloadForFeed(r.payload);
+  return c.json({ signals: rows });
+});
+
+// GET /signals/feed/stream — SSE fan-in across all the caller's channels.
+//
+// Same auth modes as the per-channel stream (header bearer or ?stream_token).
+// Implementation: subscribe once per channel the user is a member of at
+// connect time. Channels added during the connection won't push events to
+// this stream — clients should reconnect on `susu add` / `susu accept` if
+// they want the new channel included. (We document this; reconnect is cheap.)
+signalRoutes.get("/signals/feed/stream", async (c) => {
+  let me: string;
+  const headerAuth = c.req.header("authorization");
+  const streamToken = c.req.query("stream_token");
+  try {
+    if (headerAuth) {
+      me = await authedAddress(headerAuth);
+    } else if (streamToken) {
+      me = await consumeStreamToken(streamToken);
+    } else {
+      throw new AuthError(401, "missing auth (Authorization header or ?stream_token=)");
+    }
+  } catch (e) { return authError(c, e); }
+
+  // S5: per-user concurrent SSE cap (G v0.0.4 review 🟡 #1)
+  const currentConnCount = sseConnByAddr.get(me) ?? 0;
+  if (currentConnCount >= MAX_SSE_PER_ADDR) {
+    c.header("Retry-After", "10");
+    return c.json({ error: "too_many_streams", limit: MAX_SSE_PER_ADDR }, 429);
+  }
+  sseConnByAddr.set(me, currentConnCount + 1);
+
+  // Snapshot the user's channels at connect time + fetch each channel's
+  // display metadata (group name OR peer for 1-on-1) once. We attach this
+  // to each forwarded event so the client can render `from → recipient`
+  // correctly without per-event DB lookups, and without falling back to
+  // myUsername when peer info is missing (G review #2).
+  type ChannelMeta = {
+    channel_name: string | null;
+    peer: { address: string; username: string | null } | null;
+  };
+  const memberRows = await sql<any[]>`
+    SELECT
+      cm.channel_id,
+      c.name AS channel_name,
+      (
+        SELECT json_build_object('address', cm2.address, 'username', i2.username)
+        FROM channel_members cm2
+        LEFT JOIN identities i2 ON i2.address = cm2.address
+        WHERE cm2.channel_id = cm.channel_id AND cm2.address <> ${me}
+        LIMIT 1
+      ) AS peer
+    FROM channel_members cm
+    JOIN channels c ON c.channel_id = cm.channel_id
+    WHERE cm.address = ${me}
+  `;
+  const channelMeta = new Map<string, ChannelMeta>();
+  for (const r of memberRows) {
+    channelMeta.set(r.channel_id, { channel_name: r.channel_name, peer: r.peer });
+  }
+
+  return streamSSE(c, async (stream) => {
+    let aborted = false;
+    const queue: (SignalEvent & ChannelMeta)[] = [];
+    let resolveWaiter: (() => void) | null = null;
+
+    function wakeWaiter() {
+      const r = resolveWaiter;
+      resolveWaiter = null;
+      r?.();
+    }
+
+    const unsubs: Array<() => void> = [];
+    let ejected: { channel_id: string; reason: string } | null = null;
+    for (const [channel_id, meta] of channelMeta) {
+      unsubs.push(subscribe(channel_id, me, (evt) => {
+        if ((evt as EjectEvent).__close) {
+          // Drop the dead channel from our local meta cache and (importantly)
+          // STOP enriching new events for it. Don't kill the whole stream —
+          // user might still be in other channels.
+          ejected = { channel_id, reason: (evt as EjectEvent).reason };
+          channelMeta.delete(channel_id);
+          wakeWaiter();
+          return;
+        }
+        // Enrich each event with the channel's display metadata so the
+        // client can render labels consistently with /signals/feed history.
+        // Also cap payload size to match /signals/feed history behavior.
+        const e = evt as SignalEvent;
+        queue.push({ ...e, payload: truncatePayloadForFeed(e.payload), ...meta });
+        wakeWaiter();
+      }));
+    }
+
+    const heartbeat = setInterval(() => {
+      stream.writeSSE({ event: "ping", data: String(Date.now()) }).catch(() => {});
+    }, 25_000);
+
+    stream.onAbort(() => {
+      aborted = true;
+      clearInterval(heartbeat);
+      for (const u of unsubs) u();
+      wakeWaiter();
+    });
+
+    try {
+      await stream.writeSSE({
+        event: "open",
+        data: JSON.stringify({ channel_count: channelMeta.size }),
+      });
+      while (!aborted) {
+        if (queue.length === 0) {
+          await new Promise<void>((resolve) => { resolveWaiter = resolve; });
+          if (aborted) break;
+        }
+        // Surface any ejection that arrived since the last loop iteration.
+        if (ejected) {
+          await stream.writeSSE({ event: "ejected", data: JSON.stringify(ejected) }).catch(() => {});
+          ejected = null;
+        }
+        while (queue.length > 0 && !aborted) {
+          const evt = queue.shift()!;
+          await stream.writeSSE({
+            id: evt.signal_id,
+            event: "signal",
+            data: JSON.stringify(evt),
+          });
+        }
+      }
+    } finally {
+      aborted = true;
+      clearInterval(heartbeat);
+      for (const u of unsubs) u();
+      // S5: drop the per-address SSE counter we incremented at the top.
+      const c2 = (sseConnByAddr.get(me) ?? 1) - 1;
+      if (c2 <= 0) sseConnByAddr.delete(me); else sseConnByAddr.set(me, c2);
     }
   });
 });
@@ -306,7 +654,8 @@ signalRoutes.post("/signals/:id/reactions", async (c) => {
     if ((e as Error).name === "BodyLimitError") throw e;
     return c.json({ error: "invalid json body" }, 400);
   }
-  const payload = body && typeof body === "object" && "payload" in body ? body.payload : body;
+  const rawPayload = body && typeof body === "object" && "payload" in body ? body.payload : body;
+  const payload = stripControlCharsDeep(rawPayload); // see signal push handler comment above
   const isAuto = !!body?.is_auto;
 
   try {

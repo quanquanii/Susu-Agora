@@ -233,12 +233,17 @@ const TOOLS = [
   {
     name: "susu_signal_push",
     description:
-      "Push a message into a channel. Free-form JSON; common shapes are trade signals (symbol/direction/leverage/entry_price/sl/tp/reasoning) or natural-language asks. BETA = free; paid mode is $1 per message.",
+      "Push a message into a channel. Free-form JSON; common shapes are trade signals (symbol/direction/leverage/entry_price/sl/tp/reasoning) or natural-language asks. Set from_human=true ONLY when the human user is taking over the conversation (e.g. they typed `@friend ...` to you). BETA = free; paid mode is $1 per message.",
     inputSchema: {
       type: "object",
       properties: {
         channel_id: { type: "string" },
         payload: { type: "object", additionalProperties: true, description: "free-form JSON message" },
+        from_human: {
+          type: "boolean",
+          default: false,
+          description: "If true, the adapter merges {from_human:true} into the payload so the receiving agent / inbox UI can render a [HUMAN] tag. Use only for human-takeover messages.",
+        },
       },
       required: ["channel_id", "payload"],
       additionalProperties: false,
@@ -268,6 +273,19 @@ const TOOLS = [
         limit: { type: "integer", minimum: 1, maximum: 200, default: 20 },
       },
       required: ["channel_id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "susu_signals_feed",
+    description:
+      "List recent messages across ALL channels the user is in (cross-channel inbox). Use this when the user asks 'what did my friends say' or 'catch me up' without naming a specific channel. Each row includes the channel label (peer @handle for 1-on-1, group name for groups) so you can group by sender.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "integer", minimum: 1, maximum: 200, default: 50 },
+        since: { type: "string", description: "ISO 8601 timestamp; only return rows after this" },
+      },
       additionalProperties: false,
     },
   },
@@ -397,9 +415,22 @@ async function main() {
         }
 
         // ─ signals ────────────────────────────────────────────────────────
-        case "susu_signal_push":
-          result = await api(cfg, "POST", `/channels/${args.channel_id}/signals`, args.payload);
+        case "susu_signal_push": {
+          // from_human=true is a payload-level convention: the adapter merges
+          // it into the payload so the server stores it verbatim and inbox
+          // UIs / receiving agents can detect human takeover.
+          const inputPayload = args.payload ?? {};
+          let payload: any = inputPayload;
+          if (args.from_human === true) {
+            if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+              payload = { text: String(payload), from_human: true };
+            } else {
+              payload = { ...payload, from_human: true };
+            }
+          }
+          result = await api(cfg, "POST", `/channels/${args.channel_id}/signals`, payload);
           break;
+        }
         case "susu_signal_react":
           result = await api(cfg, "POST", `/signals/${args.signal_id}/reactions`, {
             payload: args.payload, is_auto: args.is_auto ?? true,
@@ -408,6 +439,13 @@ async function main() {
         case "susu_signals_recent": {
           const limit = args.limit ?? 20;
           result = await api(cfg, "GET", `/channels/${args.channel_id}/signals?limit=${limit}`);
+          break;
+        }
+        case "susu_signals_feed": {
+          const qs = new URLSearchParams();
+          qs.set("limit", String(args.limit ?? 50));
+          if (args.since) qs.set("since", String(args.since));
+          result = await api(cfg, "GET", `/signals/feed?${qs.toString()}`);
           break;
         }
 

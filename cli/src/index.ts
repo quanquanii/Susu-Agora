@@ -14,6 +14,7 @@ import { printBanner } from "./banner.ts";
 // Single source of truth — see code/shared/agent-doc.ts. Bun bundles this in
 // at `bun build` time, so the published bin/susu.mjs has it inlined.
 import { AGENT_DOC } from "../../shared/agent-doc.ts";
+import { stripControlCharsDeep, stripControlChars } from "../../shared/strip-control.ts";
 
 const HELP = `susu — Susurration CLI (alias of \`susurration\`)
 
@@ -44,10 +45,13 @@ Group rules (free-form JSON; agents compose their own conventions)
   susu meta patch <channel_id> -j JSON        Shallow-merge rules
 
 Messaging
-  susu push <target> [-m TEXT | -j JSON]      <target> = @handle (1-on-1) or <channel_id> (group)
+  susu push <target> [-m TEXT | -j JSON] [-h] <target> = @handle (1-on-1) or <channel_id> (group)
+                                              -h marks the message as from the human
   susu watch <target>                         Live-tail incoming messages (Ctrl-C exits)
   susu signals <target>                       Recent messages
   susu react <signal_id> [-m TEXT | -j JSON]  React to a message
+  susu feed [-f] [--bubbles] [--limit N]      All channels in one stream (-f follows live)
+  susu inbox                                  Open feed in a new Terminal window (macOS)
 
 Billing
   susu allowance                              Status (BETA = free; paid mode shows balance)
@@ -89,6 +93,8 @@ async function main() {
     watch: cmdWatch,
     signals: cmdSignals,
     react: cmdReact,
+    feed: cmdFeed,
+    inbox: cmdInbox,
     allowance: cmdAllowance,
     approve: cmdApprove,
     usage: cmdUsage,
@@ -568,9 +574,29 @@ async function readPayload(args: string[]): Promise<any> {
 async function cmdPush(args: string[]): Promise<number> {
   const cfg = await loadConfig();
   const target = args[0];
-  if (!target) { process.stderr.write("usage: susu push <@handle | channel_id> [-m TEXT | -j JSON]\n"); return 1; }
+  if (!target) { process.stderr.write("usage: susu push <@handle | channel_id> [-m TEXT | -j JSON] [-h]\n"); return 1; }
   const id = await resolveTargetChannel(cfg, target);
-  const payload = await readPayload(args.slice(1));
+  // -h / --human: human-takeover convention. Set from_human=true on the
+  // payload so the receiving agent (and inbox UIs) can render the message
+  // with a HUMAN tag. Server doesn't validate; this is a payload-level
+  // convention agreed on in AGENT_DOC.
+  const fromHuman = args.includes("-h") || args.includes("--human");
+  let payload = await readPayload(args.slice(1).filter((a) => a !== "-h" && a !== "--human"));
+  if (fromHuman) {
+    if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+      payload = { text: String(payload), from_human: true };
+    } else {
+      // S5: warn when -h flag overrides an explicit from_human:false in -j JSON.
+      // Flag wins (by design — flag is the most explicit signal of intent),
+      // but silent override surprises power users. (G v0.0.4 review 🟡 #4)
+      if ((payload as any).from_human === false) {
+        process.stderr.write(
+          `warning: -h flag overrides "from_human": false in your JSON payload\n`,
+        );
+      }
+      payload = { ...payload, from_human: true };
+    }
+  }
   try {
     const out = await api<any>(cfg, `/channels/${id}/signals`, {
       method: "POST", body: JSON.stringify(payload),
@@ -638,7 +664,7 @@ async function cmdSignals(args: string[]): Promise<number> {
   return printJsonOrTable(args, out, (o) =>
     o.signals.map((s: any) => {
       const who = s.from_username ? `@${s.from_username}` : "(unregistered)";
-      return `${s.created_at}  ${who.padEnd(20)}  ${JSON.stringify(s.payload)}`;
+      return `${fmtTimePlain(s.created_at)}  ${who.padEnd(20)}  ${JSON.stringify(s.payload)}`;
     }).join("\n") + "\n",
   );
 }
@@ -649,11 +675,15 @@ async function cmdWatch(args: string[]): Promise<number> {
   if (!target) { process.stderr.write("usage: susu watch <@handle | channel_id>\n"); return 1; }
   if (!cfg.token) { process.stderr.write("not logged in\n"); return 2; }
   const id = await resolveTargetChannel(cfg, target);
-  // R2: mint a single-use stream_token instead of leaking the bearer in URL.
-  const st = await api<{ stream_token: string }>(cfg, "/auth/stream-token", { method: "POST" });
-  const url = `${cfg.api_url.replace(/\/$/, "")}/channels/${id}/signals/stream?stream_token=${encodeURIComponent(st.stream_token)}`;
+  // S5: CLI uses Authorization header instead of ?stream_token. node fetch
+  // supports custom headers on SSE; only browsers (EventSource) need the
+  // query-string fallback. Avoids token leakage to platform access logs
+  // (G v0.0.4 review 🟡 #5).
+  const url = `${cfg.api_url.replace(/\/$/, "")}/channels/${id}/signals/stream`;
   process.stderr.write(`tailing ${id} (Ctrl-C to exit)\n`);
-  const resp = await fetch(url);
+  const resp = await fetch(url, {
+    headers: { Authorization: `Bearer ${cfg.token}` },
+  });
   if (!resp.ok || !resp.body) {
     process.stderr.write(`stream error: HTTP ${resp.status}\n`);
     return 1;
@@ -676,16 +706,411 @@ async function cmdWatch(args: string[]): Promise<number> {
       }
       if (event === "ping") continue;
       if (event === "open") { process.stderr.write("connected\n"); continue; }
+      if (event === "ejected" && data) {
+        try {
+          const ej = JSON.parse(data);
+          process.stderr.write(`(ejected — reason: ${ej.reason ?? "unknown"})\n`);
+        } catch { process.stderr.write(`(ejected: ${data})\n`); }
+        continue;
+      }
       if (event === "signal" && data) {
         try {
           const e = JSON.parse(data);
-          const who = e.from_username ? `@${e.from_username}` : "(unregistered)";
-          process.stdout.write(`${e.created_at}  ${who.padEnd(20)}  ${JSON.stringify(e.payload)}\n`);
+          const who = e.from_username ? `@${stripControlChars(e.from_username)}` : "(unregistered)";
+          // S5: strip ANSI/control chars from payload before terminal render
+          // (defense-in-depth; backend strips on push too).
+          const safePayload = stripControlCharsDeep(e.payload);
+          process.stdout.write(`${fmtTimePlain(e.created_at)}  ${who.padEnd(20)}  ${JSON.stringify(safePayload)}\n`);
         } catch { process.stdout.write(data + "\n"); }
       }
     }
   }
   return 0;
+}
+
+// ───────── feed / inbox (cross-channel views) ─────────────────────────────
+//
+// `susu feed`         → plain log of last N messages across all channels
+// `susu feed -f`      → bootstrap N + live SSE tail
+// `susu feed --bubbles -f` → bubble UI (chat-app feel) + live tail
+// `susu inbox`        → opens a fresh macOS Terminal window running the
+//                       bubble version of `feed -f`, then returns. Designed
+//                       so the human can leave it in another desktop / on a
+//                       second monitor while they keep working elsewhere.
+//
+// Channel labels are computed server-side (peer @handle for 1-on-1, group
+// name for groups), so the client just renders.
+
+interface FeedRow {
+  signal_id: string;
+  channel_id: string;
+  from_address: string;
+  from_username: string | null;
+  payload: any;
+  created_at: string;
+  channel_name?: string | null;
+  peer?: { address: string; username: string | null } | null;
+}
+
+function channelLabel(row: FeedRow, myAddress: string): string {
+  if (row.channel_name) return row.channel_name;
+  if (row.peer?.username) return `@${row.peer.username}`;
+  // Fall back: 1-on-1 with unregistered peer → first 6 chars of channel_id.
+  return row.channel_id.slice(0, 8);
+}
+
+/** "Who is this message addressed to" — used as the right-hand side of
+ *  `<from> → <to>`. For 1-on-1, the recipient depends on who sent (peer
+ *  if I sent, me if peer sent). For groups, it's the group name. */
+function recipientLabel(row: FeedRow, myAddress: string, myUsername: string | null): string {
+  if (row.channel_name) return row.channel_name; // group
+  if (row.from_address === myAddress) {
+    return row.peer?.username ? `@${row.peer.username}` : "(unregistered)";
+  }
+  return myUsername ? `@${myUsername}` : "me";
+}
+
+// ANSI helpers — color-code participants. Pure ANSI, no deps. Falls back
+// to plain when stdout isn't a TTY (e.g. piped to a file).
+const PALETTE = ["\x1b[35m", "\x1b[36m", "\x1b[33m", "\x1b[34m", "\x1b[31m", "\x1b[95m", "\x1b[96m", "\x1b[93m"];
+const RESET = "\x1b[0m";
+const DIM = "\x1b[2m";
+const BOLD = "\x1b[1m";
+const GREEN = "\x1b[32m";
+
+function colorFor(handle: string): string {
+  if (!process.stdout.isTTY) return "";
+  let h = 0;
+  for (const ch of handle) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+  return PALETTE[h % PALETTE.length]!;
+}
+function dim(s: string): string { return process.stdout.isTTY ? `${DIM}${s}${RESET}` : s; }
+function bold(s: string): string { return process.stdout.isTTY ? `${BOLD}${s}${RESET}` : s; }
+
+// Terminal display-width math. CJK / fullwidth / common emoji = 2 cols;
+// everything else = 1 col. ANSI escapes are stripped first. We need this
+// because `String#length` counts code units, which under-counts CJK and
+// breaks bubble box alignment (right border drifts left, padding too short).
+function displayWidth(s: string): number {
+  const stripped = s.replace(/\x1b\[[0-9;]*m/g, "");
+  let w = 0;
+  for (const ch of stripped) {
+    const code = ch.codePointAt(0)!;
+    if (
+      (code >= 0x1100 && code <= 0x115F) ||
+      (code >= 0x2E80 && code <= 0x303E) ||
+      (code >= 0x3041 && code <= 0x33FF) ||
+      (code >= 0x3400 && code <= 0x4DBF) ||
+      (code >= 0x4E00 && code <= 0x9FFF) ||
+      (code >= 0xA000 && code <= 0xA4CF) ||
+      (code >= 0xAC00 && code <= 0xD7A3) ||
+      (code >= 0xF900 && code <= 0xFAFF) ||
+      (code >= 0xFE30 && code <= 0xFE4F) ||
+      (code >= 0xFF00 && code <= 0xFF60) ||
+      (code >= 0xFFE0 && code <= 0xFFE6) ||
+      (code >= 0x1F300 && code <= 0x1F9FF)
+    ) {
+      w += 2;
+    } else {
+      w += 1;
+    }
+  }
+  return w;
+}
+
+function padEndDisplay(s: string, width: number): string {
+  const w = displayWidth(s);
+  if (w >= width) return s;
+  return s + " ".repeat(width - w);
+}
+
+/** Greedy wrap on display-width (CJK-aware), preserving existing newlines. */
+function wrapByDisplayWidth(text: string, maxWidth: number): string[] {
+  const out: string[] = [];
+  for (const para of text.split(/\r?\n/)) {
+    if (para.length === 0) { out.push(""); continue; }
+    let buf = "";
+    let bufW = 0;
+    for (const ch of para) {
+      const cw = displayWidth(ch);
+      if (bufW + cw > maxWidth && buf.length > 0) {
+        out.push(buf);
+        buf = ch;
+        bufW = cw;
+      } else {
+        buf += ch;
+        bufW += cw;
+      }
+    }
+    if (buf.length > 0) out.push(buf);
+  }
+  return out;
+}
+
+function renderPayloadCompact(payload: any): string {
+  // S5: strip ANSI / control chars at render time (defense-in-depth — server
+  // also strips on push, but this protects against legacy data and any code
+  // path where payload reaches a terminal without going through the new push
+  // handler). See shared/strip-control.ts.
+  payload = stripControlCharsDeep(payload);
+  if (payload === null || payload === undefined) return "";
+  if (typeof payload === "string") return payload;
+  if (typeof payload === "object" && "text" in payload && Object.keys(payload).length <= 2) {
+    return String(payload.text);
+  }
+  return JSON.stringify(payload);
+}
+
+// Format timestamps in UTC (anchor for global team — no per-user timezone
+// drift). Plain log: full date+time; bubble: time-of-day only (the bootstrap
+// banner already gives the date context).
+function fmtTimePlain(iso: string): string {
+  // 2026-04-30T11:27:55.521Z → "2026-04-30 11:27:55 UTC"
+  return iso.replace(/T/, " ").replace(/\.\d+Z$/, " UTC").replace(/Z$/, " UTC");
+}
+function fmtTimeBubble(iso: string): string {
+  // 2026-04-30T11:27:55.521Z → "11:27:55 UTC"
+  const m = iso.match(/T(\d{2}:\d{2}:\d{2})/);
+  return (m ? m[1] : iso) + " UTC";
+}
+
+function renderPlainLine(row: FeedRow, myAddress: string, myUsername: string | null): string {
+  // username has its own server-enforced charset (5-20 chars [a-z0-9_-])
+  // so it's safe; we strip anyway as a belt-and-braces measure.
+  const who = row.from_username ? `@${stripControlChars(row.from_username)}` : "(unregistered)";
+  const to = recipientLabel(row, myAddress, myUsername);
+  const isHuman = row.payload && typeof row.payload === "object" && row.payload.from_human === true;
+  const tag = isHuman ? (process.stdout.isTTY ? `\x1b[1;33m[HUMAN]\x1b[0m ` : `[HUMAN] `) : "";
+  return `${dim(fmtTimePlain(row.created_at))}  ${tag}${padEndDisplay(who, 18)} → ${padEndDisplay(to, 18)}  ${renderPayloadCompact(row.payload)}`;
+}
+
+function renderBubble(row: FeedRow, myAddress: string, myUsername: string | null, termWidth: number): string {
+  const fromMe = row.from_address === myAddress;
+  const who = row.from_username ? `@${row.from_username}` : "(unregistered)";
+  const time = fmtTimeBubble(row.created_at);
+  const isHuman = row.payload && typeof row.payload === "object" && row.payload.from_human === true;
+  const tag = isHuman ? "[HUMAN] " : "";
+  // Only emit color codes on a real TTY; piped/redirected output stays plain.
+  const color = !process.stdout.isTTY ? "" : (fromMe ? GREEN : colorFor(who));
+  const dot = process.stdout.isTTY ? `${color}●${RESET}` : "●";
+
+  const text = renderPayloadCompact(row.payload);
+  // Bubble takes ~60% of terminal width; floor at 20 cols so very narrow
+  // terminals still get a usable shape.
+  const maxBubbleInner = Math.max(16, Math.floor(termWidth * 0.6) - 4);
+
+  const wrapped = wrapByDisplayWidth(text, maxBubbleInner);
+  const innerWidth = Math.max(...wrapped.map((l) => displayWidth(l)), 0);
+  const top    = "┌" + "─".repeat(innerWidth + 2) + "┐";
+  const bottom = "└" + "─".repeat(innerWidth + 2) + "┘";
+  const body   = wrapped.map((l) => "│ " + padEndDisplay(l, innerWidth) + " │");
+  const bubbleVisualWidth = innerWidth + 4; // 2 borders + 2 spaces
+
+  // HUMAN tag rendered prominently — bold + yellow if TTY (eye-catching but
+  // not "ALERT" red, since human-takeover is normal protocol behavior).
+  const humanTag = isHuman
+    ? (process.stdout.isTTY ? `\x1b[1;33m[HUMAN]\x1b[0m ` : `[HUMAN] `)
+    : "";
+
+  const lines: string[] = [];
+  if (fromMe) {
+    // Right-aligned: header + bubble lines pushed to right edge.
+    const header = `${dim(time)}  ${humanTag}${color}${who}${process.stdout.isTTY ? RESET : ""} ${dot}`;
+    const headerVisualWidth = displayWidth(header);
+    lines.push(" ".repeat(Math.max(0, termWidth - headerVisualWidth)) + header);
+    for (const l of [top, ...body, bottom]) {
+      lines.push(
+        " ".repeat(Math.max(0, termWidth - bubbleVisualWidth)) +
+        (process.stdout.isTTY ? color + l + RESET : l),
+      );
+    }
+  } else {
+    // Left-aligned.
+    const header = `${dot} ${color}${who}${process.stdout.isTTY ? RESET : ""}  ${humanTag}${dim(time)}  ${dim("→ " + recipientLabel(row, myAddress, myUsername))}`;
+    lines.push(header);
+    for (const l of [top, ...body, bottom]) {
+      lines.push("   " + (process.stdout.isTTY ? color + l + RESET : l));
+    }
+  }
+  return lines.join("\n");
+}
+
+async function cmdFeed(args: string[]): Promise<number> {
+  const cfg = await loadConfig();
+  if (!cfg.token) { process.stderr.write("not logged in (run `susu login`)\n"); return 2; }
+
+  const follow = args.includes("-f") || args.includes("--follow");
+  const bubbles = args.includes("--bubbles");
+  const since = pickFlag(args, "--since");
+
+  // Defensive parsing — server validates too (returns 400) but failing fast
+  // gives a cleaner CLI error than waiting for an HTTP round-trip.
+  const rawLimit = pickFlag(args, "--limit");
+  const limit = rawLimit === undefined ? 50 : Number(rawLimit);
+  if (!Number.isFinite(limit)) {
+    process.stderr.write(`error: --limit must be a finite number (got "${rawLimit}")\n`);
+    return 1;
+  }
+  if (since !== undefined && !Number.isFinite(Date.parse(since))) {
+    process.stderr.write(`error: --since must be ISO 8601 (e.g. 2026-04-30T00:00:00Z), got "${since}"\n`);
+    return 1;
+  }
+
+  const myAddress = String(cfg.address ?? "");
+  const myUsername = (cfg.handle as string | undefined) ?? null;
+  const termWidth = Math.max(40, Math.min(120, process.stdout.columns ?? 80));
+
+  function renderRow(row: FeedRow) {
+    if (bubbles) process.stdout.write(renderBubble(row, myAddress, myUsername, termWidth) + "\n");
+    else process.stdout.write(renderPlainLine(row, myAddress, myUsername) + "\n");
+  }
+
+  // 1. History bootstrap.
+  const qs = new URLSearchParams();
+  qs.set("limit", String(Math.min(Math.max(limit, 1), 200)));
+  if (since) qs.set("since", since);
+  const hist = await api<{ signals: FeedRow[] }>(cfg, `/signals/feed?${qs.toString()}`);
+  // Server returns DESC; reverse to chrono so the latest line lands at the
+  // bottom (matches `tail -f` mental model).
+  const ordered = [...hist.signals].reverse();
+
+  if (bubbles && process.stdout.isTTY) {
+    process.stdout.write(`${dim("─── inbox · showing last " + ordered.length + " from server ─────────────────")}\n`);
+    process.stdout.write(`${dim("─── for older runs: susu feed --since YYYY-MM-DD ────────────────────")}\n`);
+    process.stdout.write(`${dim("─── tip: Terminal > Settings > Profiles > Window > Scrollback: Unlimited")}\n\n`);
+  }
+  for (const row of ordered) {
+    renderRow(row);
+    if (bubbles) process.stdout.write("\n");
+  }
+
+  if (!follow) return 0;
+
+  // 2. Live tail via SSE on /signals/feed/stream.
+  if (bubbles && process.stdout.isTTY) {
+    process.stdout.write(`${dim("─── live · Ctrl-C to exit ──────────────────────────────────────────")}\n\n`);
+  } else {
+    process.stderr.write("─── live (Ctrl-C to exit) ───────────────\n");
+  }
+
+  // S5: header auth — see susu watch for rationale (G 🟡 #5).
+  const url = `${cfg.api_url.replace(/\/$/, "")}/signals/feed/stream`;
+  const resp = await fetch(url, {
+    headers: { Authorization: `Bearer ${cfg.token}` },
+  });
+  if (!resp.ok || !resp.body) {
+    process.stderr.write(`stream error: HTTP ${resp.status}\n`);
+    return 1;
+  }
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const parts = buf.split(/\r?\n\r?\n/);
+    buf = parts.pop() ?? "";
+    for (const block of parts) {
+      let event = "message", data = "";
+      for (const line of block.split(/\r?\n/)) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        else if (line.startsWith("data:")) data += line.slice(5).trim();
+      }
+      if (event === "ping") continue;
+      if (event === "open") continue;
+      if (event === "ejected" && data) {
+        try {
+          const ej = JSON.parse(data);
+          process.stderr.write(
+            `(ejected from ${ej.channel_id ?? "channel"} — reason: ${ej.reason ?? "unknown"})\n`,
+          );
+        } catch { process.stderr.write(`(ejected: ${data})\n`); }
+        continue;
+      }
+      if (event === "signal" && data) {
+        try {
+          const e = JSON.parse(data) as FeedRow;
+          // Backend /signals/feed/stream enriches every event with
+          // channel_name + peer (matches the /signals/feed history schema),
+          // so renderRow's recipientLabel resolves correctly for groups too.
+          renderRow(e);
+          if (bubbles) process.stdout.write("\n");
+        } catch { process.stdout.write(data + "\n"); }
+      }
+    }
+  }
+  return 0;
+}
+
+function pickFlag(args: string[], name: string): string | undefined {
+  const i = args.indexOf(name);
+  if (i < 0) return undefined;
+  return args[i + 1];
+}
+
+async function cmdInbox(args: string[]): Promise<number> {
+  // macOS-only convenience: open a new Terminal window and run the bubble
+  // feed in it. On non-mac systems we suggest the manual fallback.
+  if (process.platform !== "darwin") {
+    process.stderr.write(
+      "susu inbox is macOS-only convenience.\n" +
+      "On Linux/Windows, open any terminal and run:\n" +
+      "  susu feed --bubbles -f\n",
+    );
+    return 1;
+  }
+  // Default 200 — inbox is meant for "leave it open all day, glance at it"
+  // mode. 200 is a balance between coverage and bootstrap latency.
+  const limit = pickFlag(args, "--limit") ?? "200";
+  // Validate so attacker-influenced env can't sneak shell metas via --limit.
+  if (!/^\d{1,4}$/.test(limit)) {
+    process.stderr.write(`error: --limit must be a small positive integer, got "${limit}"\n`);
+    return 1;
+  }
+  const argv1 = process.argv[1] ?? "susu";
+  const binPath = argv1.startsWith("/") ? argv1 : "susu";
+
+  // S5 (G v0.0.4 review 🟡 #6): write a temp shell script and have osascript
+  // launch only the script path. Two wins over inline string concat:
+  //   - osascript only sees a we-control absolute path (we wrote it just now,
+  //     no user-controlled chars in the path components) — AppleScript escape
+  //     stops being attack surface
+  //   - env vars (SUSU_API_URL / SUSU_HOME) are quoted ONCE inside the script
+  //     via shellQuote, instead of going through two layers of escape
+  const fs = await import("node:fs/promises");
+  const path = await import("node:path");
+  const os = await import("node:os");
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "susu-inbox-"));
+  const scriptPath = path.join(tmpDir, "run.sh");
+  const lines = ["#!/bin/zsh"];
+  if (process.env.SUSU_API_URL) {
+    lines.push(`export SUSU_API_URL=${shellQuote(process.env.SUSU_API_URL)}`);
+  }
+  if (process.env.SUSU_HOME) {
+    lines.push(`export SUSU_HOME=${shellQuote(process.env.SUSU_HOME)}`);
+  }
+  lines.push(`exec ${shellQuote(binPath)} feed --bubbles -f --limit ${limit}`);
+  await fs.writeFile(scriptPath, lines.join("\n") + "\n", { mode: 0o700 });
+
+  const { spawn } = await import("node:child_process");
+  // scriptPath is fully under our control (mkdtemp + literal "run.sh"), so
+  // it's a known-safe ASCII string. Still escape defensively in case a
+  // future macOS tmpdir contains spaces or weird chars.
+  const escaped = scriptPath.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const osa = `tell application "Terminal"
+  activate
+  do script "${escaped}"
+end tell`;
+  const child = spawn("osascript", ["-e", osa], { stdio: "inherit" });
+  await new Promise<void>((resolve) => child.on("exit", () => resolve()));
+  process.stdout.write("opened inbox in a new Terminal window.\n");
+  return 0;
+}
+
+function shellQuote(s: string): string {
+  if (/^[A-Za-z0-9_/.:=@-]+$/.test(s)) return s;
+  return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
 // ───────── billing (non-custodial: SPL Approve + on-chain delegate) ───────

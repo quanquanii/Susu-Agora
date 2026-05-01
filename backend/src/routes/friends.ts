@@ -16,6 +16,7 @@ import { sql } from "../db.ts";
 import { authedAddress, AuthError, isValidSolanaAddress } from "../auth.ts";
 import { parseJsonBody, invalidJson } from "../lib/http.ts";
 import { recordEvent, hashAddress } from "../lib/events.ts";
+import { ejectAddressFromChannel } from "./signals.ts";
 
 export const friendRoutes = new Hono();
 
@@ -185,6 +186,12 @@ friendRoutes.post("/friends/remove", async (c) => {
     return { found: true as const, channel_id: link[0]!.channel_id };
   });
   if (!result.found) return c.json({ error: "not_friends" }, 404);
+  // Close any active SSE subscription either side has on this 1-on-1 channel.
+  // Both sides need to know — me + the now-ex-friend (target.address). The
+  // channel itself is gone (CASCADE deleted), so the eject is mostly a clean
+  // FYI; without it, the open SSE just idles with no events. (G v0.0.4 #2)
+  ejectAddressFromChannel(result.channel_id, me, "unfriended");
+  ejectAddressFromChannel(result.channel_id, target.address, "unfriended");
   recordEvent({ type: "friend_remove", address: me, channelId: result.channel_id });
   return c.json({ status: "removed", channel_id: result.channel_id });
 });
