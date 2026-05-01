@@ -669,63 +669,126 @@ async function cmdSignals(args: string[]): Promise<number> {
   );
 }
 
+// Result of one stream attempt — drives reconnect decision in cmdWatch.
+type WatchResult = "ejected" | "disconnected" | "auth_error";
+
 async function cmdWatch(args: string[]): Promise<number> {
   const cfg = await loadConfig();
   const target = args[0];
   if (!target) { process.stderr.write("usage: susu watch <@handle | channel_id>\n"); return 1; }
   if (!cfg.token) { process.stderr.write("not logged in\n"); return 2; }
   const id = await resolveTargetChannel(cfg, target);
-  // S5: CLI uses Authorization header instead of ?stream_token. node fetch
-  // supports custom headers on SSE; only browsers (EventSource) need the
-  // query-string fallback. Avoids token leakage to platform access logs
-  // (G v0.0.4 review 🟡 #5).
   const url = `${cfg.api_url.replace(/\/$/, "")}/channels/${id}/signals/stream`;
   process.stderr.write(`tailing ${id} (Ctrl-C to exit)\n`);
-  const resp = await fetch(url, {
-    headers: { Authorization: `Bearer ${cfg.token}` },
-  });
+
+  // Ctrl-C → process.exit handles cleanup; user-initiated abort skips reconnect.
+  let userAborted = false;
+  const onSigint = () => { userAborted = true; process.exit(0); };
+  process.on("SIGINT", onSigint);
+
+  // Reconnect with exponential backoff: 1s → 2s → 4s → ... cap 30s.
+  // Reset to 1s whenever the previous connection lasted ≥ 30s (treats it as a
+  // transient blip, not a persistent failure).
+  let backoffMs = 1000;
+  const MAX_BACKOFF = 30_000;
+  const STABLE_THRESHOLD_MS = 30_000;
+
+  try {
+    while (!userAborted) {
+      const startedAt = Date.now();
+      const result = await runOneWatchStream(url, cfg.token);
+      const elapsed = Date.now() - startedAt;
+
+      if (result === "ejected") return 0;
+      if (result === "auth_error") return 1;
+      // result === "disconnected" → reconnect
+
+      if (userAborted) break;
+      if (elapsed >= STABLE_THRESHOLD_MS) backoffMs = 1000;
+      process.stderr.write(`(disconnected, reconnecting in ${(backoffMs / 1000).toFixed(1)}s...)\n`);
+      await new Promise<void>((resolve) => setTimeout(resolve, backoffMs));
+      backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF);
+    }
+  } finally {
+    process.off("SIGINT", onSigint);
+  }
+  return 0;
+}
+
+// One SSE attempt. Returns:
+//   - "ejected": server told us we're kicked → caller should NOT reconnect.
+//   - "auth_error": 401/403 → caller should NOT reconnect.
+//   - "disconnected": any other failure (network blip, server hangup, parse
+//     error) → caller SHOULD reconnect.
+async function runOneWatchStream(url: string, token: string): Promise<WatchResult> {
+  let resp;
+  try {
+    // S5: CLI uses Authorization header instead of ?stream_token. node fetch
+    // supports custom headers on SSE; only browsers (EventSource) need the
+    // query-string fallback. Avoids token leakage to platform access logs
+    // (G v0.0.4 review 🟡 #5).
+    resp = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  } catch {
+    return "disconnected";
+  }
+  if (resp.status === 401 || resp.status === 403) {
+    process.stderr.write(`stream error: HTTP ${resp.status}\n`);
+    return "auth_error";
+  }
   if (!resp.ok || !resp.body) {
     process.stderr.write(`stream error: HTTP ${resp.status}\n`);
-    return 1;
+    return "disconnected";
   }
+
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
-  // SSE parse: messages separated by blank line, fields prefixed `field: `.
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const parts = buf.split(/\r?\n\r?\n/);
-    buf = parts.pop() ?? "";
-    for (const block of parts) {
-      let event = "message", data = "";
-      for (const line of block.split(/\r?\n/)) {
-        if (line.startsWith("event:")) event = line.slice(6).trim();
-        else if (line.startsWith("data:")) data += line.slice(5).trim();
-      }
-      if (event === "ping") continue;
-      if (event === "open") { process.stderr.write("connected\n"); continue; }
-      if (event === "ejected" && data) {
-        try {
-          const ej = JSON.parse(data);
-          process.stderr.write(`(ejected — reason: ${ej.reason ?? "unknown"})\n`);
-        } catch { process.stderr.write(`(ejected: ${data})\n`); }
-        continue;
-      }
-      if (event === "signal" && data) {
-        try {
-          const e = JSON.parse(data);
-          const who = e.from_username ? `@${stripControlChars(e.from_username)}` : "(unregistered)";
-          // S5: strip ANSI/control chars from payload before terminal render
-          // (defense-in-depth; backend strips on push too).
-          const safePayload = stripControlCharsDeep(e.payload);
-          process.stdout.write(`${fmtTimePlain(e.created_at)}  ${who.padEnd(20)}  ${JSON.stringify(safePayload)}\n`);
-        } catch { process.stdout.write(data + "\n"); }
+  let ejected = false;
+
+  try {
+    // SSE parse: messages separated by blank line, fields prefixed `field: `.
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const parts = buf.split(/\r?\n\r?\n/);
+      buf = parts.pop() ?? "";
+      for (const block of parts) {
+        let event = "message", data = "";
+        for (const line of block.split(/\r?\n/)) {
+          if (line.startsWith("event:")) event = line.slice(6).trim();
+          else if (line.startsWith("data:")) data += line.slice(5).trim();
+        }
+        if (event === "ping") continue;
+        if (event === "open") { process.stderr.write("connected\n"); continue; }
+        if (event === "ejected" && data) {
+          try {
+            const ej = JSON.parse(data);
+            process.stderr.write(`(ejected — reason: ${ej.reason ?? "unknown"})\n`);
+          } catch { process.stderr.write(`(ejected: ${data})\n`); }
+          ejected = true;
+          continue;
+        }
+        if (event === "signal" && data) {
+          try {
+            const e = JSON.parse(data);
+            const who = e.from_username ? `@${stripControlChars(e.from_username)}` : "(unregistered)";
+            // S5: strip ANSI/control chars from payload before terminal render
+            // (defense-in-depth; backend strips on push too).
+            const safePayload = stripControlCharsDeep(e.payload);
+            process.stdout.write(`${fmtTimePlain(e.created_at)}  ${who.padEnd(20)}  ${JSON.stringify(safePayload)}\n`);
+          } catch { process.stdout.write(data + "\n"); }
+        }
       }
     }
+  } catch {
+    // reader.read() threw (most commonly TypeError: terminated when the
+    // underlying socket dies — undici's standard abort error). Fall through
+    // and let the caller reconnect with backoff.
+  } finally {
+    try { await reader.cancel(); } catch {}
   }
-  return 0;
+  return ejected ? "ejected" : "disconnected";
 }
 
 // ───────── feed / inbox (cross-channel views) ─────────────────────────────
