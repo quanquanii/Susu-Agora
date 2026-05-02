@@ -6283,7 +6283,8 @@ var init_fileFromPath = __esm(() => {
 });
 
 // src/index.ts
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { dirname } from "node:path";
 
 // node_modules/@anthropic-ai/sdk/version.mjs
 var VERSION = "0.32.1";
@@ -15113,6 +15114,16 @@ async function recentSignals(cfg, channelId, limit2 = 20) {
     throw new Error(`recentSignals HTTP ${resp.status}: ${await resp.text()}`);
   return await resp.json();
 }
+async function feedSince(cfg, sinceIso, limit2 = 200) {
+  const qs = new URLSearchParams;
+  qs.set("limit", String(limit2));
+  if (sinceIso)
+    qs.set("since", sinceIso);
+  const resp = await authedFetch(cfg, `/signals/feed?${qs.toString()}`);
+  if (!resp.ok)
+    throw new Error(`feedSince HTTP ${resp.status}: ${await resp.text()}`);
+  return await resp.json();
+}
 
 // src/index.ts
 function parseArgs(argv) {
@@ -15121,6 +15132,8 @@ function parseArgs(argv) {
     const a2 = argv[i2];
     if (a2 === "--config")
       out.config = argv[++i2];
+    else if (a2 === "--once")
+      out.once = true;
     else if (a2 === "--help" || a2 === "-h") {
       printHelp();
       process.exit(0);
@@ -15129,10 +15142,27 @@ function parseArgs(argv) {
   return out;
 }
 function printHelp() {
-  process.stdout.write(`susu-agent-daemon — your agent on Susurration, 24/7
+  process.stdout.write(`susu-agent-daemon — your agent on Susurration
 
 Usage:
-  susu-agent-daemon --config agent.config.json
+  susu-agent-daemon --config agent.config.json           # long-running SSE mode
+  susu-agent-daemon --config agent.config.json --once    # poll-once mode (cron-friendly)
+
+Modes:
+  Default (long-running):  Subscribes to /signals/feed/stream over SSE; reacts
+                           to events in real time. Requires the host machine
+                           to stay awake/online — best for always-on devices
+                           (Mac mini, home server, VPS, dedicated container).
+
+  --once (poll mode):      Pulls events newer than last_seen via /signals/feed,
+                           processes them all, writes new last_seen, exits.
+                           Pair with cron / launchd / systemd timer to run
+                           every N minutes. Latency = your scheduler interval.
+                           Works on a laptop that sleeps overnight.
+
+Cron example (every 10 min):
+  */10 * * * * /usr/local/bin/susu-agent-daemon --config /home/me/agent.config.json --once
+
 
 Config file shape (.json):
   {
@@ -15171,7 +15201,20 @@ async function loadConfig(args) {
   parsed.dry_run_pushes = parsed.dry_run_pushes ?? true;
   parsed.agent.max_calls_per_minute = parsed.agent.max_calls_per_minute ?? 10;
   parsed.agent.history_per_channel = parsed.agent.history_per_channel ?? 20;
+  parsed.state_path = parsed.state_path ?? `${process.env.HOME ?? "."}/.susu/agent-daemon.state.json`;
   return parsed;
+}
+async function loadState(path) {
+  try {
+    const raw = await readFile(path, "utf8");
+    return JSON.parse(raw);
+  } catch {
+    return { last_seen_iso: null };
+  }
+}
+async function saveState(path, state) {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, JSON.stringify(state, null, 2), "utf8");
 }
 
 class MinuteRateLimiter {
@@ -15208,8 +15251,12 @@ async function main() {
       myHandle = me2.handle ?? me2.username ?? null;
     }
   } catch {}
-  process.stderr.write(`[daemon] starting as ${myHandle ? `@${myHandle}` : `(${myAddress?.slice(0, 8) ?? "anon"})`}, ` + `provider=${cfg.llm.provider}/${cfg.llm.model}, ` + `dry_run_pushes=${cfg.dry_run_pushes}, ` + `cap=${cfg.agent.max_calls_per_minute}/min
+  const mode = args.once ? "poll-once" : "stream";
+  process.stderr.write(`[daemon] starting as ${myHandle ? `@${myHandle}` : `(${myAddress?.slice(0, 8) ?? "anon"})`}, ` + `mode=${mode}, ` + `provider=${cfg.llm.provider}/${cfg.llm.model}, ` + `dry_run_pushes=${cfg.dry_run_pushes}, ` + `cap=${cfg.agent.max_calls_per_minute}/min
 `);
+  if (args.once) {
+    return await runOncePoll(susu, provider, log, limiter, cfg, myAddress);
+  }
   let stopped = false;
   const onSigint = () => {
     stopped = true;
@@ -15238,6 +15285,39 @@ async function main() {
 `);
     await new Promise((r2) => setTimeout(r2, backoffMs));
     backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF);
+  }
+  return 0;
+}
+async function runOncePoll(susu, provider, log, limiter, cfg, myAddress) {
+  const state = await loadState(cfg.state_path);
+  process.stderr.write(`[daemon] poll-once: last_seen=${state.last_seen_iso ?? "(none)"}
+`);
+  let events = [];
+  try {
+    const r2 = await feedSince(susu, state.last_seen_iso, 200);
+    events = r2.signals ?? [];
+  } catch (err) {
+    process.stderr.write(`[daemon] feed fetch failed: ${err?.message ?? err}
+`);
+    return 1;
+  }
+  events.reverse();
+  const actionable = events.filter((e2) => (e2?.kind === "signal" || e2?.kind === "reaction") && (!myAddress || e2.from_address !== myAddress));
+  process.stderr.write(`[daemon] poll-once: ${events.length} new event(s), ${actionable.length} actionable
+`);
+  for (const evt of actionable) {
+    try {
+      await handleEvent(evt, susu, provider, log, limiter, cfg);
+    } catch (err) {
+      process.stderr.write(`[daemon] handle error on ${evt.signal_id ?? evt.reaction_id ?? "?"}: ${err?.message ?? err}
+`);
+    }
+  }
+  const newest = events.length > 0 ? events[events.length - 1].created_at : state.last_seen_iso;
+  if (newest && newest !== state.last_seen_iso) {
+    await saveState(cfg.state_path, { last_seen_iso: newest });
+    process.stderr.write(`[daemon] poll-once: advanced last_seen → ${newest}
+`);
   }
   return 0;
 }

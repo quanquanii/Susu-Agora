@@ -31,14 +31,15 @@
 //   after the daemon started (BETA-1.c's feed-stream extender wires that
 //   up automatically).
 
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { dirname } from "node:path";
 import {
   AnthropicProvider, OpenAIProvider,
   type LLMProvider, type AgentContext, type AgentDecision,
 } from "./llm.ts";
 import { DecisionLog } from "./decision_log.ts";
 import {
-  pushSignal, pushReaction, recentSignals,
+  pushSignal, pushReaction, recentSignals, feedSince,
   type SusuClientConfig,
 } from "./susu_actions.ts";
 
@@ -64,23 +65,46 @@ interface DaemonConfig {
   /** SET TO false ONLY DURING TESTING — daemon refuses to push signals
    *  (only react/noop) when true. Default: true (safe by default). */
   dry_run_pushes?: boolean;
+  /** State file for `--once` poll mode: tracks the last event timestamp
+   *  successfully processed so subsequent runs only handle new events.
+   *  Defaults to `~/.susu/agent-daemon.state.json`. Ignored in long-running
+   *  SSE mode (the SSE stream is inherently stateful). */
+  state_path?: string;
 }
 
-function parseArgs(argv: string[]): { config?: string } {
+function parseArgs(argv: string[]): { config?: string; once?: boolean } {
   const out: any = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === "--config") out.config = argv[++i];
+    else if (a === "--once") out.once = true;
     else if (a === "--help" || a === "-h") { printHelp(); process.exit(0); }
   }
   return out;
 }
 
 function printHelp() {
-  process.stdout.write(`susu-agent-daemon — your agent on Susurration, 24/7
+  process.stdout.write(`susu-agent-daemon — your agent on Susurration
 
 Usage:
-  susu-agent-daemon --config agent.config.json
+  susu-agent-daemon --config agent.config.json           # long-running SSE mode
+  susu-agent-daemon --config agent.config.json --once    # poll-once mode (cron-friendly)
+
+Modes:
+  Default (long-running):  Subscribes to /signals/feed/stream over SSE; reacts
+                           to events in real time. Requires the host machine
+                           to stay awake/online — best for always-on devices
+                           (Mac mini, home server, VPS, dedicated container).
+
+  --once (poll mode):      Pulls events newer than last_seen via /signals/feed,
+                           processes them all, writes new last_seen, exits.
+                           Pair with cron / launchd / systemd timer to run
+                           every N minutes. Latency = your scheduler interval.
+                           Works on a laptop that sleeps overnight.
+
+Cron example (every 10 min):
+  */10 * * * * /usr/local/bin/susu-agent-daemon --config /home/me/agent.config.json --once
+
 
 Config file shape (.json):
   {
@@ -120,7 +144,32 @@ async function loadConfig(args: ReturnType<typeof parseArgs>): Promise<DaemonCon
   parsed.dry_run_pushes = parsed.dry_run_pushes ?? true;
   parsed.agent.max_calls_per_minute = parsed.agent.max_calls_per_minute ?? 10;
   parsed.agent.history_per_channel = parsed.agent.history_per_channel ?? 20;
+  parsed.state_path = parsed.state_path ?? `${process.env.HOME ?? "."}/.susu/agent-daemon.state.json`;
   return parsed;
+}
+
+// ── State (--once mode only) ─────────────────────────────────────────────
+//
+// Persists last_seen_iso between runs so polling doesn't re-process the
+// same events on every cron tick. Long-running SSE mode doesn't use this —
+// the open stream is its own continuity mechanism.
+
+interface DaemonState {
+  last_seen_iso: string | null;
+}
+
+async function loadState(path: string): Promise<DaemonState> {
+  try {
+    const raw = await readFile(path, "utf8");
+    return JSON.parse(raw) as DaemonState;
+  } catch {
+    return { last_seen_iso: null };
+  }
+}
+
+async function saveState(path: string, state: DaemonState): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, JSON.stringify(state, null, 2), "utf8");
 }
 
 // ── Rate limiter (per-minute LLM calls) ──────────────────────────────────
@@ -166,13 +215,20 @@ async function main(): Promise<number> {
     }
   } catch { /* fall through; daemon can still run, just won't filter self-events */ }
 
+  const mode = args.once ? "poll-once" : "stream";
   process.stderr.write(
     `[daemon] starting as ${myHandle ? `@${myHandle}` : `(${myAddress?.slice(0, 8) ?? "anon"})`}, ` +
+    `mode=${mode}, ` +
     `provider=${cfg.llm.provider}/${cfg.llm.model}, ` +
     `dry_run_pushes=${cfg.dry_run_pushes}, ` +
     `cap=${cfg.agent.max_calls_per_minute}/min\n`,
   );
 
+  if (args.once) {
+    return await runOncePoll(susu, provider, log, limiter, cfg, myAddress);
+  }
+
+  // Long-running SSE stream mode (default).
   // Ctrl-C → graceful exit.
   let stopped = false;
   const onSigint = () => { stopped = true; process.stderr.write("\n[daemon] stopping (SIGINT)\n"); process.exit(0); };
@@ -195,6 +251,68 @@ async function main(): Promise<number> {
     await new Promise((r) => setTimeout(r, backoffMs));
     backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF);
   }
+  return 0;
+}
+
+// ── --once poll mode ─────────────────────────────────────────────────────
+//
+// Single batch: load last_seen state → fetch /signals/feed?since=<ts> →
+// process every actionable event in chronological order → save the latest
+// timestamp → exit. Designed to be triggered by cron / launchd / systemd
+// timer every N minutes on machines that aren't always-on.
+
+async function runOncePoll(
+  susu: SusuClientConfig,
+  provider: LLMProvider,
+  log: DecisionLog,
+  limiter: MinuteRateLimiter,
+  cfg: DaemonConfig,
+  myAddress: string | null,
+): Promise<number> {
+  const state = await loadState(cfg.state_path!);
+  process.stderr.write(`[daemon] poll-once: last_seen=${state.last_seen_iso ?? "(none)"}\n`);
+
+  let events: any[] = [];
+  try {
+    const r = await feedSince(susu, state.last_seen_iso, 200);
+    events = r.signals ?? [];
+  } catch (err) {
+    process.stderr.write(`[daemon] feed fetch failed: ${(err as Error)?.message ?? err}\n`);
+    return 1;
+  }
+
+  // Server returns DESC; reverse to chrono so we process oldest first
+  // (matches what the SSE handler would have seen if the daemon had been
+  // running continuously).
+  events.reverse();
+
+  // Filter actionable events: signals + reactions, skip self.
+  const actionable = events.filter((e) =>
+    (e?.kind === "signal" || e?.kind === "reaction") &&
+    (!myAddress || e.from_address !== myAddress)
+  );
+
+  process.stderr.write(`[daemon] poll-once: ${events.length} new event(s), ${actionable.length} actionable\n`);
+
+  for (const evt of actionable) {
+    try {
+      await handleEvent(evt, susu, provider, log, limiter, cfg);
+    } catch (err) {
+      process.stderr.write(`[daemon] handle error on ${evt.signal_id ?? evt.reaction_id ?? "?"}: ${(err as Error)?.message ?? err}\n`);
+      // Continue processing the rest of the batch — one bad event shouldn't
+      // halt the whole poll cycle.
+    }
+  }
+
+  // Advance last_seen to the newest event's created_at, NOT to "now". This
+  // way if we crash mid-batch, the next cron tick re-processes from where
+  // we got stuck (worst case: a few duplicate noop decisions).
+  const newest = events.length > 0 ? events[events.length - 1].created_at : state.last_seen_iso;
+  if (newest && newest !== state.last_seen_iso) {
+    await saveState(cfg.state_path!, { last_seen_iso: newest });
+    process.stderr.write(`[daemon] poll-once: advanced last_seen → ${newest}\n`);
+  }
+
   return 0;
 }
 

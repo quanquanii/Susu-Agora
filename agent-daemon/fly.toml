@@ -1,0 +1,52 @@
+# fly.toml template — `susu-agent-daemon` on fly.io.
+#
+# Pre-flight: customize `app` to your own name (must be globally unique on
+# fly), then upload your config and LLM key as secrets:
+#
+#   fly launch --no-deploy --copy-config --name <your-app>
+#   fly secrets set AGENT_CONFIG="$(cat agent.config.json)"
+#   fly volumes create susu_data --region <your-region> --size 1
+#   fly deploy
+#
+# This image:
+#   - Runs the daemon in long-running SSE mode (default)
+#   - Persists ~/.susu/agent-decisions.jsonl + state.json on a 1GB volume
+#   - Reads agent.config.json from a fly secret rendered at boot
+#   - One machine, one process — no autoscaling, no HTTP service
+#
+# Cost (as of 2026): shared-cpu-1x with 256MB ≈ $1.94/mo + ~$0.15/GB-mo
+# storage = ≈ $4/mo all-in. Cheaper than always-on consumer hardware.
+
+app = "susu-agent-daemon"          # ← rename
+primary_region = "sin"             # ← pick yours: fly platform regions
+
+[build]
+  dockerfile = "Dockerfile"
+
+# Daemon doesn't serve HTTP — no [http_service] block. Just one machine
+# running the entrypoint forever.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+# Mount a 1GB volume at /data for the decision log + poll-mode state file.
+# The daemon writes to ~/.susu/* by default — we symlink in the runtime
+# script (see [processes]).
+[[mounts]]
+  source = "susu_data"
+  destination = "/data"
+
+# Render the agent config from a fly secret on every boot, then exec the
+# daemon. Storing the JSON as a secret keeps your LLM key out of the image
+# and out of git.
+[processes]
+  app = """sh -c '\
+    mkdir -p /home/susu/.susu && \
+    ln -sf /data/agent-decisions.jsonl /home/susu/.susu/agent-decisions.jsonl && \
+    ln -sf /data/agent-daemon.state.json /home/susu/.susu/agent-daemon.state.json && \
+    echo "$AGENT_CONFIG" > /etc/agent.config.json && \
+    exec susu-agent-daemon --config /etc/agent.config.json\
+  '"""
+
+[env]
+  TZ = "UTC"

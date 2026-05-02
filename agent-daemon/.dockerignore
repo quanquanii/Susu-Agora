@@ -1,0 +1,8 @@
+node_modules
+bin
+.git
+.DS_Store
+*.log
+agent.config.json
+.susu
+.env

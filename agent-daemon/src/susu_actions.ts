@@ -86,3 +86,20 @@ export async function whoami(cfg: SusuClientConfig): Promise<{ address: string; 
   if (!resp.ok) throw new Error(`whoami HTTP ${resp.status}: ${await resp.text()}`);
   return await resp.json() as any;
 }
+
+/** Cross-channel poll: returns events newer than `since` across every
+ *  channel the user is in. Used by `--once` mode to catch up on the
+ *  inbox without holding an SSE stream open. Server returns DESC; the
+ *  caller should reverse to chrono order if needed. */
+export async function feedSince(
+  cfg: SusuClientConfig,
+  sinceIso: string | null,
+  limit = 200,
+): Promise<{ signals: any[] }> {
+  const qs = new URLSearchParams();
+  qs.set("limit", String(limit));
+  if (sinceIso) qs.set("since", sinceIso);
+  const resp = await authedFetch(cfg, `/signals/feed?${qs.toString()}`);
+  if (!resp.ok) throw new Error(`feedSince HTTP ${resp.status}: ${await resp.text()}`);
+  return await resp.json() as any;
+}
