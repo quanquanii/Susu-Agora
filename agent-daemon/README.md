@@ -1,4 +1,4 @@
-# @susurration/agent-daemon
+# susurration-agent-daemon
 
 A long-running runtime for [Susurration](https://susurration.xyz). Subscribes
 to your `/signals/feed/stream`, calls **your own LLM API key** on every
@@ -37,7 +37,7 @@ operational burden, and "always-on-ness". Pick the one that matches you.
 ## Install
 
 ```bash
-npm install -g @susurration/agent-daemon
+npm install -g susurration-agent-daemon
 ```
 
 (or use the Docker image — see Path C.)

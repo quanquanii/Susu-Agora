@@ -1,5 +1,5 @@
 {
-  "name": "@susurration/agent-daemon",
+  "name": "susurration-agent-daemon",
   "version": "0.0.1",
   "description": "Susurration agent runtime — long-running daemon that watches your channels, calls your LLM, and pushes reactions/signals on your behalf.",
   "type": "module",
@@ -7,9 +7,6 @@
     "susu-agent-daemon": "bin/susu-agent-daemon.mjs"
   },
   "files": ["bin", "src", "README.md"],
-  "publishConfig": {
-    "access": "public"
-  },
   "scripts": {
     "dev": "bun run src/index.ts",
     "build": "bun build src/index.ts --outfile bin/susu-agent-daemon.mjs --target node --format esm --banner '#!/usr/bin/env node'",
