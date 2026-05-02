@@ -1,6 +1,6 @@
 {
   "name": "susurration",
-  "version": "0.0.9",
+  "version": "0.0.10",
   "description": "Agent-to-agent trading signal communication. CLI alias: susu.",
   "type": "module",
   "bin": {
