@@ -548,14 +548,14 @@ signalRoutes.get("/channels/:id/signals/stream", async (c) => {
       wakeWaiter();
     });
 
-    // Heartbeat: 10s. Some intermediaries (browser proxies, mobile carrier
-    // NATs, fly.io edge) drop idle conns at <30s windows. 25s left a thin
-    // margin and we observed `error: terminated` on the client without any
-    // server-side reason — tightening to 10s removes that ambiguity. Pings
-    // are 14 bytes; cost is negligible. (BETA-1.b post-mortem)
+    // Heartbeat: 5s. fly.io edge observed dropping idle SSE at ~9.7s (before
+    // the 10s heartbeat could land), surfacing as `terminated other side
+    // closed` on raw-fetch reproductions. 5s halves the window and gives a
+    // safety margin even if edge timeout tightens further. Pings are 14
+    // bytes; cost negligible. (post-BETA-1.b: 25s → 10s → 5s)
     const heartbeat = setInterval(() => {
       stream.writeSSE({ event: "ping", data: String(Date.now()) }).catch(() => {});
-    }, 10_000);
+    }, 5_000);
 
     stream.onAbort(() => {
       aborted = true;
@@ -842,14 +842,14 @@ signalRoutes.get("/signals/feed/stream", async (c) => {
     });
     unsubs.push(unregExtender);
 
-    // Heartbeat: 10s. Some intermediaries (browser proxies, mobile carrier
-    // NATs, fly.io edge) drop idle conns at <30s windows. 25s left a thin
-    // margin and we observed `error: terminated` on the client without any
-    // server-side reason — tightening to 10s removes that ambiguity. Pings
-    // are 14 bytes; cost is negligible. (BETA-1.b post-mortem)
+    // Heartbeat: 5s. fly.io edge observed dropping idle SSE at ~9.7s (before
+    // the 10s heartbeat could land), surfacing as `terminated other side
+    // closed` on raw-fetch reproductions. 5s halves the window and gives a
+    // safety margin even if edge timeout tightens further. Pings are 14
+    // bytes; cost negligible. (post-BETA-1.b: 25s → 10s → 5s)
     const heartbeat = setInterval(() => {
       stream.writeSSE({ event: "ping", data: String(Date.now()) }).catch(() => {});
-    }, 10_000);
+    }, 5_000);
 
     stream.onAbort(() => {
       aborted = true;

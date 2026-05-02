@@ -205,7 +205,7 @@ async function main(): Promise<number> {
   let myAddress: string | null = null;
   let myHandle: string | null = null;
   try {
-    const meResp = await fetch(susu.api_url.replace(/\/$/, "") + "/me", {
+    const meResp = await fetch(susu.api_url.replace(/\/$/, "") + "/identity/whoami", {
       headers: { authorization: `Bearer ${susu.token}` },
     });
     if (meResp.ok) {

@@ -60,16 +60,35 @@ const TOOL_NOOP = {
 const TOOL_REACT = {
   name: "react_to_signal",
   description:
-    "React to a peer's signal (acknowledge, agree, disagree, propose modification). Use for trade signals where you want to take a position-style stance without sending a fresh message.",
+    "React to a peer's signal (acknowledge, agree, disagree, propose modification). Use for trade signals where you want to take a position-style stance without sending a fresh message. The payload is what the PEER sees on the wire — `reason` is private to your own decision log, so always express your stance via payload.value.",
   parameters: {
     type: "object",
     properties: {
       signal_id: { type: "string", description: "ID of the signal you're reacting to (from triggering_event.signal_id)." },
       payload: {
         type: "object",
-        description: "Free-form reaction payload. Common shape: {value: '+1' | '-1' | string, note: '...', size_factor: number}.",
+        description: "Reaction visible to the peer. value is required so the peer can see your stance.",
+        properties: {
+          value: {
+            type: "string",
+            enum: ["+1", "-1"],
+            description: "+1 = agree (would also take this trade). -1 = disagree (signal looks bad).",
+          },
+          size_factor: {
+            type: "number",
+            minimum: 0.1,
+            maximum: 1.0,
+            description: "Optional. How much of the peer's size you'd take (1.0 = full, 0.5 = half). Use lower values when partially agreeing or when value=-1 to signal the small residual conviction.",
+          },
+          note: {
+            type: "string",
+            description: "Optional. ≤15 words explaining the stance to the peer (separate from `reason` which is your private decision log).",
+          },
+        },
+        required: ["value"],
+        additionalProperties: true,
       },
-      reason: { type: "string", description: "Brief reasoning visible in decision log." },
+      reason: { type: "string", description: "Brief reasoning visible only in YOUR decision log (peer doesn't see this)." },
     },
     required: ["signal_id", "payload", "reason"],
   },
