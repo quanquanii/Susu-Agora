@@ -670,7 +670,13 @@ async function cmdSignals(args: string[]): Promise<number> {
 }
 
 // Result of one stream attempt — drives reconnect decision in cmdWatch.
-type WatchResult = "ejected" | "disconnected" | "auth_error";
+//   - retryAfterMs lets server-imposed cooldowns (HTTP 429 with Retry-After)
+//     override the default backoff schedule, avoiding tight reconnect storms
+//     that would just hit the cap again.
+type WatchResult =
+  | { kind: "ejected" }
+  | { kind: "auth_error" }
+  | { kind: "disconnected"; retryAfterMs?: number };
 
 async function cmdWatch(args: string[]): Promise<number> {
   const cfg = await loadConfig();
@@ -699,14 +705,22 @@ async function cmdWatch(args: string[]): Promise<number> {
       const result = await runOneWatchStream(url, cfg.token);
       const elapsed = Date.now() - startedAt;
 
-      if (result === "ejected") return 0;
-      if (result === "auth_error") return 1;
-      // result === "disconnected" → reconnect
+      if (result.kind === "ejected") return 0;
+      if (result.kind === "auth_error") {
+        process.stderr.write(
+          "your session has expired. Run `susu login` to re-authenticate.\n",
+        );
+        return 1;
+      }
+      // result.kind === "disconnected" → reconnect
 
       if (userAborted) break;
       if (elapsed >= STABLE_THRESHOLD_MS) backoffMs = 1000;
-      process.stderr.write(`(disconnected, reconnecting in ${(backoffMs / 1000).toFixed(1)}s...)\n`);
-      await new Promise<void>((resolve) => setTimeout(resolve, backoffMs));
+      // Server-imposed cooldown (e.g. 429 too_many_streams) wins over our
+      // default schedule — reconnecting before Retry-After just rejects again.
+      const sleepMs = result.retryAfterMs ?? backoffMs;
+      process.stderr.write(`(disconnected, reconnecting in ${(sleepMs / 1000).toFixed(1)}s...)\n`);
+      await new Promise<void>((resolve) => setTimeout(resolve, sleepMs));
       backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF);
     }
   } finally {
@@ -728,16 +742,27 @@ async function runOneWatchStream(url: string, token: string): Promise<WatchResul
     // query-string fallback. Avoids token leakage to platform access logs
     // (G v0.0.4 review 🟡 #5).
     resp = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-  } catch {
-    return "disconnected";
+  } catch (err) {
+    if (process.env.SUSU_DEBUG) {
+      process.stderr.write(`(SUSU_DEBUG fetch failed: ${(err as Error)?.message ?? err})\n`);
+    }
+    return { kind: "disconnected" };
   }
   if (resp.status === 401 || resp.status === 403) {
     process.stderr.write(`stream error: HTTP ${resp.status}\n`);
-    return "auth_error";
+    return { kind: "auth_error" };
+  }
+  if (resp.status === 429) {
+    // Server says we're over the per-user concurrent SSE cap. Honor
+    // Retry-After (seconds) so we don't tight-loop into another 429.
+    const ra = Number(resp.headers.get("retry-after") ?? "10");
+    const retryAfterMs = Number.isFinite(ra) ? Math.max(ra * 1000, 1000) : 10_000;
+    process.stderr.write(`stream error: HTTP 429 too_many_streams (retry after ${(retryAfterMs / 1000).toFixed(0)}s)\n`);
+    return { kind: "disconnected", retryAfterMs };
   }
   if (!resp.ok || !resp.body) {
     process.stderr.write(`stream error: HTTP ${resp.status}\n`);
-    return "disconnected";
+    return { kind: "disconnected" };
   }
 
   const reader = resp.body.getReader();
@@ -769,26 +794,34 @@ async function runOneWatchStream(url: string, token: string): Promise<WatchResul
           ejected = true;
           continue;
         }
-        if (event === "signal" && data) {
+        // BETA-1.c: backend now broadcasts signal / reaction / channel_* /
+        // friend_* / channel_invited / channel_created on the same channel
+        // SSE. renderWireEvent dispatches by `kind`. Unknown kinds (future
+        // event types) → null → silent skip (forward-compatible).
+        if (data) {
           try {
             const e = JSON.parse(data);
-            const who = e.from_username ? `@${stripControlChars(e.from_username)}` : "(unregistered)";
-            // S5: strip ANSI/control chars from payload before terminal render
-            // (defense-in-depth; backend strips on push too).
-            const safePayload = stripControlCharsDeep(e.payload);
-            process.stdout.write(`${fmtTimePlain(e.created_at)}  ${who.padEnd(20)}  ${JSON.stringify(safePayload)}\n`);
-          } catch { process.stdout.write(data + "\n"); }
+            const line = renderWireEvent(e);
+            if (line) process.stdout.write(line + "\n");
+          } catch (err) {
+            if (process.env.SUSU_DEBUG) {
+              process.stderr.write(`(SUSU_DEBUG parse error event=${event}: ${err})\n${data}\n`);
+            }
+          }
         }
       }
     }
-  } catch {
+  } catch (err) {
     // reader.read() threw (most commonly TypeError: terminated when the
     // underlying socket dies — undici's standard abort error). Fall through
     // and let the caller reconnect with backoff.
+    if (process.env.SUSU_DEBUG) {
+      process.stderr.write(`(SUSU_DEBUG stream broken: ${(err as Error)?.message ?? err})\n`);
+    }
   } finally {
     try { await reader.cancel(); } catch {}
   }
-  return ejected ? "ejected" : "disconnected";
+  return ejected ? { kind: "ejected" } : { kind: "disconnected" };
 }
 
 // ───────── feed / inbox (cross-channel views) ─────────────────────────────
@@ -935,6 +968,49 @@ function fmtTimeBubble(iso: string): string {
   // 2026-04-30T11:27:55.521Z → "11:27:55 UTC"
   const m = iso.match(/T(\d{2}:\d{2}:\d{2})/);
   return (m ? m[1] : iso) + " UTC";
+}
+
+// Render a single wire event to a one-line plain string. Covers all event
+// kinds the backend SSE emits (signal / reaction / channel_* / friend_* /
+// channel_invited / channel_created). Unknown kinds → null (caller should
+// skip silently — forward-compat with future event types).
+//
+// Used by `susu watch` (channel SSE, no channel-meta enrichment) and as the
+// non-signal-event fallback in `susu feed -f` (signal events still go through
+// renderPlainLine / renderBubble for consistent label formatting).
+function renderWireEvent(e: any): string | null {
+  e = stripControlCharsDeep(e);
+  if (!e || typeof e !== "object" || typeof e.kind !== "string") return null;
+  const t = dim(fmtTimePlain(e.created_at ?? ""));
+  const w = (addr: string | null | undefined, name: string | null | undefined): string =>
+    name ? `@${stripControlChars(String(name))}` : (addr ? String(addr).slice(0, 8) + "…" : "?");
+  const short = (id: string | undefined): string => id ? String(id).slice(0, 8) : "";
+  switch (e.kind) {
+    case "signal":
+      return `${t}  ${w(e.from_address, e.from_username).padEnd(20)}  ${JSON.stringify(e.payload)}`;
+    case "reaction":
+      return `${t}  ${w(e.from_address, e.from_username).padEnd(20)}  ↳ react ${short(e.signal_id)}: ${JSON.stringify(e.payload)}`;
+    case "channel_member_added":
+      return `${t}  ${dim("[member +]")}          ${w(e.address, e.username)} joined (by ${w(e.by, null)})`;
+    case "channel_member_removed":
+      return `${t}  ${dim("[member −]")}          ${w(e.address, e.username)} ${e.reason}${e.by ? " by " + w(e.by, null) : ""}`;
+    case "channel_meta_changed":
+      return `${t}  ${dim(`[meta ${e.method}]`)}         by ${w(e.by, null)}${e.size_bytes ? ` (${e.size_bytes}B)` : ""}`;
+    case "channel_owner_transferred":
+      return `${t}  ${dim("[owner →]")}           ${w(e.from_address, null)} → ${w(e.to_address, null)} (${e.reason})`;
+    case "friend_request":
+      return `${t}  ${dim("[friend req]")}        from ${w(e.from_address, e.from_username)} (req ${short(e.request_id)})`;
+    case "friend_accepted":
+      return `${t}  ${dim("[friend ✓]")}          ${w(e.with_address, e.with_username)}${e.auto ? " (auto)" : ""} → channel ${short(e.channel_id)}`;
+    case "friend_removed":
+      return `${t}  ${dim("[unfriended]")}        by ${w(e.by_address, e.by_username)} (channel ${short(e.channel_id)} closed)`;
+    case "channel_invited":
+      return `${t}  ${dim("[invited]")}           by ${w(e.by, e.by_username)} → ${e.channel_name ?? short(e.channel_id)}`;
+    case "channel_created":
+      return `${t}  ${dim("[created]")}           ${e.is_group ? "group" : "1on1"} ${e.name ?? short(e.channel_id)}`;
+    default:
+      return null;
+  }
 }
 
 function renderPlainLine(row: FeedRow, myAddress: string, myUsername: string | null): string {
@@ -1091,15 +1167,27 @@ async function cmdFeed(args: string[]): Promise<number> {
         } catch { process.stderr.write(`(ejected: ${data})\n`); }
         continue;
       }
-      if (event === "signal" && data) {
+      if (data) {
         try {
-          const e = JSON.parse(data) as FeedRow;
-          // Backend /signals/feed/stream enriches every event with
-          // channel_name + peer (matches the /signals/feed history schema),
-          // so renderRow's recipientLabel resolves correctly for groups too.
-          renderRow(e);
-          if (bubbles) process.stdout.write("\n");
-        } catch { process.stdout.write(data + "\n"); }
+          const e = JSON.parse(data);
+          if (e.kind === "signal") {
+            // Backend /signals/feed/stream enriches signal events with
+            // channel_name + peer (matches /signals/feed history schema), so
+            // renderRow's recipientLabel resolves correctly for groups too.
+            renderRow(e as FeedRow);
+            if (bubbles) process.stdout.write("\n");
+          } else {
+            // BETA-1.c: non-signal events (reaction / channel_* / friend_*)
+            // get the compact wire-event one-liner. Bubble formatting is
+            // signal-specific; system events stay plain.
+            const line = renderWireEvent(e);
+            if (line) process.stdout.write(line + "\n");
+          }
+        } catch (err) {
+          if (process.env.SUSU_DEBUG) {
+            process.stderr.write(`(SUSU_DEBUG feed parse error event=${event}: ${err})\n`);
+          }
+        }
       }
     }
   }
