@@ -81,7 +81,18 @@ export const signalRoutes = new Hono();
 
 // In-process pub/sub. One process per Fly machine in v0.1; if we scale to
 // multiple machines later we'll swap to LISTEN/NOTIFY on Postgres.
-type SignalEvent = {
+//
+// BETA-1.c: unified event taxonomy. Every wire event has `kind` so clients
+// can route by switch. Recipients are addressed by `RecipientKey` which is
+// either `chan:<channel_id>` (anyone watching that channel) or
+// `user:<address>` (cross-channel events for that user — friend requests,
+// channel invites, system notifications). One `subscribers` map handles
+// both — atomic rule, no parallel publishUser/publishChannel data structures.
+
+// ── Event taxonomy (wire format) ──────────────────────────────────────────
+
+export type SignalEvent = {
+  kind: "signal";
   signal_id: string;
   channel_id: string;
   from_address: string;
@@ -92,15 +103,124 @@ type SignalEvent = {
   payload: unknown;
   created_at: string;
 };
+
+export type ReactionEvent = {
+  kind: "reaction";
+  reaction_id: string;
+  signal_id: string;
+  channel_id: string;
+  from_address: string;
+  from_username: string | null;
+  payload: unknown;
+  is_auto: boolean;
+  created_at: string;
+};
+
+export type ChannelMemberAddedEvent = {
+  kind: "channel_member_added";
+  channel_id: string;
+  address: string;
+  username: string | null;
+  by: string;
+  created_at: string;
+};
+
+export type ChannelMemberRemovedEvent = {
+  kind: "channel_member_removed";
+  channel_id: string;
+  address: string;
+  username: string | null;
+  by: string | null;
+  reason: "left" | "kicked" | "unfriended" | "disbanded";
+  created_at: string;
+};
+
+export type ChannelMetaChangedEvent = {
+  kind: "channel_meta_changed";
+  channel_id: string;
+  by: string;
+  method: "PUT" | "PATCH";
+  size_bytes?: number;
+  created_at: string;
+};
+
+export type ChannelOwnerTransferredEvent = {
+  kind: "channel_owner_transferred";
+  channel_id: string;
+  from_address: string;
+  to_address: string;
+  reason: "transfer" | "auto_elected_on_leave";
+  created_at: string;
+};
+
+export type FriendRequestEvent = {
+  kind: "friend_request";
+  request_id: string;
+  from_address: string;
+  from_username: string | null;
+  created_at: string;
+};
+
+export type FriendAcceptedEvent = {
+  kind: "friend_accepted";
+  channel_id: string;
+  with_address: string;
+  with_username: string | null;
+  auto: boolean;
+  created_at: string;
+};
+
+export type FriendRemovedEvent = {
+  kind: "friend_removed";
+  by_address: string;
+  by_username: string | null;
+  channel_id: string;
+  created_at: string;
+};
+
+export type ChannelInvitedEvent = {
+  kind: "channel_invited";
+  channel_id: string;
+  by: string;
+  by_username: string | null;
+  channel_name: string | null;
+  created_at: string;
+};
+
+export type ChannelCreatedEvent = {
+  kind: "channel_created";
+  channel_id: string;
+  is_group: boolean;
+  name: string | null;
+  created_at: string;
+};
+
+export type Event =
+  | SignalEvent
+  | ReactionEvent
+  | ChannelMemberAddedEvent
+  | ChannelMemberRemovedEvent
+  | ChannelMetaChangedEvent
+  | ChannelOwnerTransferredEvent
+  | FriendRequestEvent
+  | FriendAcceptedEvent
+  | FriendRemovedEvent
+  | ChannelInvitedEvent
+  | ChannelCreatedEvent;
+
 // Sentinel pushed via the same fn() to signal "you've been ejected from the
-// channel, abort the SSE stream now". Distinguished from SignalEvent by the
+// channel, abort the SSE stream now". Distinguished from real events by the
 // __close field. (G v0.0.4 review #2)
-type EjectEvent = { __close: true; reason: string };
+export type EjectEvent = { __close: true; reason: string };
+
+// ── Subscribers (unified key) ─────────────────────────────────────────────
+
+type RecipientKey = string;  // `chan:<channel_id>` or `user:<address>`
 type Subscriber = {
   address: string;
-  fn: (e: SignalEvent | EjectEvent) => void;
+  fn: (e: Event | EjectEvent) => void;
 };
-const subscribers = new Map<string, Set<Subscriber>>();
+const subscribers = new Map<RecipientKey, Set<Subscriber>>();
 
 /** Live SSE subscriber counts. /health uses this. */
 export function sseStats(): { channels: number; subscribers: number } {
@@ -109,30 +229,98 @@ export function sseStats(): { channels: number; subscribers: number } {
   return { channels: subscribers.size, subscribers: total };
 }
 
-function publish(channelId: string, evt: SignalEvent) {
-  const subs = subscribers.get(channelId);
+function publish(recipient: RecipientKey, evt: Event) {
+  const subs = subscribers.get(recipient);
   if (!subs) return;
   for (const s of subs) {
     try { s.fn(evt); } catch { /* never let one slow consumer break others */ }
   }
 }
 
+/** Publish to all subscribers watching this channel (channel-scope events:
+ *  signal / reaction / channel_member_* / channel_meta_changed / etc). */
+export function publishChannel(channelId: string, evt: Event) {
+  publish(`chan:${channelId}`, evt);
+}
+
+/** Publish to all live SSE streams owned by this user (user-scope events:
+ *  friend_request / friend_accepted / friend_removed / channel_invited /
+ *  channel_created). Routed via the user's feed-stream subscriber, which
+ *  registers a `user:<addr>` subscription on connect. */
+export function publishUser(address: string, evt: Event) {
+  publish(`user:${address}`, evt);
+}
+
 function subscribe(
-  channelId: string,
+  recipient: RecipientKey,
   address: string,
-  fn: (e: SignalEvent | EjectEvent) => void,
+  fn: (e: Event | EjectEvent) => void,
 ): () => void {
-  let subs = subscribers.get(channelId);
+  let subs = subscribers.get(recipient);
   if (!subs) {
     subs = new Set();
-    subscribers.set(channelId, subs);
+    subscribers.set(recipient, subs);
   }
   const entry: Subscriber = { address, fn };
   subs.add(entry);
   return () => {
     subs!.delete(entry);
-    if (subs!.size === 0) subscribers.delete(channelId);
+    if (subs!.size === 0) subscribers.delete(recipient);
   };
+}
+
+// ── Feed-stream dynamic-channel subscribe (G v0.0.6 review #1 fix) ────────
+//
+// Problem: feed/stream subscribes to all the user's channels at CONNECT time
+// (snapshot). When a new channel is created mid-stream (auto-accept friend
+// add, accept pending request, get invited to a group), the existing
+// feed-stream subscriber wouldn't receive any signals from that channel —
+// the user would see `friend_accepted` / `channel_invited` notification but
+// no actual messages until they reconnect.
+//
+// Fix: feed/stream handlers register an "extender" callback in this map.
+// Routes that create/join channels for a user call notifyFeedStreamsNewChannel
+// which invokes each registered extender, causing live feed-streams to
+// dynamically subscribe to the new channel.
+
+export type FeedStreamMeta = {
+  channel_name: string | null;
+  peer: { address: string; username: string | null } | null;
+};
+type FeedStreamExtender = (channelId: string, meta: FeedStreamMeta) => void;
+const feedStreamExtenders = new Map<string, Set<FeedStreamExtender>>();
+
+export function notifyFeedStreamsNewChannel(
+  address: string,
+  channelId: string,
+  meta: FeedStreamMeta,
+) {
+  const exts = feedStreamExtenders.get(address);
+  if (!exts) return;
+  for (const ext of exts) {
+    try { ext(channelId, meta); } catch {}
+  }
+}
+
+/** Internal: feed/stream handler registers itself; returns unregister fn. */
+function registerFeedStreamExtender(address: string, ext: FeedStreamExtender): () => void {
+  let s = feedStreamExtenders.get(address);
+  if (!s) { s = new Set(); feedStreamExtenders.set(address, s); }
+  s.add(ext);
+  return () => {
+    s!.delete(ext);
+    if (s!.size === 0) feedStreamExtenders.delete(address);
+  };
+}
+
+// ── Address logging helper ───────────────────────────────────────────────
+//
+// BETA-1.b post-mortem #2: don't log full base58 addresses (events table
+// policy in ADR 2026-04-29 — NO full addresses). For diagnostic logs we
+// truncate to first 8 chars + ellipsis; that's enough to correlate without
+// publishing pubkey-as-identifier.
+function logAddr(addr: string): string {
+  return addr.slice(0, 8) + "…";
 }
 
 /** Externally close all SSE subscriptions for `address` on `channelId`.
@@ -141,7 +329,8 @@ function subscribe(
  *  open SSE connection keeps streaming new messages — real data leak
  *  per G v0.0.4 review #2. */
 export function ejectAddressFromChannel(channelId: string, address: string, reason: string) {
-  const subs = subscribers.get(channelId);
+  const recipient = `chan:${channelId}`;
+  const subs = subscribers.get(recipient);
   if (!subs) return;
   for (const s of [...subs]) {
     if (s.address === address) {
@@ -149,20 +338,20 @@ export function ejectAddressFromChannel(channelId: string, address: string, reas
       subs.delete(s);
     }
   }
-  if (subs.size === 0) subscribers.delete(channelId);
+  if (subs.size === 0) subscribers.delete(recipient);
 }
 
 /** Eject `address` from EVERY channel they're subscribed to. Use when the
  *  user's account is fully wiped (future: `susu logout --hard` / soft delete). */
 export function ejectAddressEverywhere(address: string, reason: string) {
-  for (const [channelId, subs] of subscribers) {
+  for (const [recipient, subs] of subscribers) {
     for (const s of [...subs]) {
       if (s.address === address) {
         try { s.fn({ __close: true, reason }); } catch {}
         subs.delete(s);
       }
     }
-    if (subs.size === 0) subscribers.delete(channelId);
+    if (subs.size === 0) subscribers.delete(recipient);
   }
 }
 
@@ -239,7 +428,8 @@ signalRoutes.post("/channels/:id/signals", async (c) => {
       };
     });
 
-    publish(channelId, {
+    publishChannel(channelId, {
+      kind: "signal",
       signal_id: result.signal_id,
       channel_id: channelId,
       from_address: me,
@@ -337,7 +527,7 @@ signalRoutes.get("/channels/:id/signals/stream", async (c) => {
     // letting the loop's finally{} run (was leaking ~1 frame per disconnect).
     let aborted = false;
     let unsub = () => {};
-    const queue: SignalEvent[] = [];
+    const queue: Event[] = [];
     let resolveWaiter: (() => void) | null = null;
 
     function wakeWaiter() {
@@ -347,14 +537,14 @@ signalRoutes.get("/channels/:id/signals/stream", async (c) => {
     }
 
     let ejected: { reason: string } | null = null;
-    unsub = subscribe(channelId, me, (evt) => {
+    unsub = subscribe(`chan:${channelId}`, me, (evt) => {
       if ((evt as EjectEvent).__close) {
         ejected = { reason: (evt as EjectEvent).reason };
         aborted = true;
         wakeWaiter();
         return;
       }
-      queue.push(evt as SignalEvent);
+      queue.push(evt as Event);
       wakeWaiter();
     });
 
@@ -384,9 +574,18 @@ signalRoutes.get("/channels/:id/signals/stream", async (c) => {
         }
         while (queue.length > 0 && !aborted) {
           const evt = queue.shift()!;
+          // SSE event name = our `kind` (signal / reaction / channel_*),
+          // letting clients route by Last-Event-Id + event name. id field
+          // is signal_id for signal/reaction events, channel_id otherwise
+          // (so reconnect with Last-Event-Id stays meaningful per-stream).
+          // Channel SSE shouldn't carry user-scope events (those go to
+          // user: key), so narrowing to the channel-scope subset is safe.
+          const eventName = evt.kind;
+          const anyEvt = evt as any;
+          const id = anyEvt.signal_id ?? anyEvt.channel_id ?? "";
           await stream.writeSSE({
-            id: evt.signal_id,
-            event: "signal",
+            id,
+            event: eventName,
             data: JSON.stringify(evt),
           });
         }
@@ -401,8 +600,9 @@ signalRoutes.get("/channels/:id/signals/stream", async (c) => {
       // "client TCP died" from "we wrote to a closed socket" from "DB blew
       // up". Previously this fell silently into finally{} and the client
       // saw a bare `error: terminated` with no server-side breadcrumb.
+      // Address logged truncated per ADR (no full pubkey in logs).
       console.warn(
-        `[sse:channel] stream broken channel=${channelId} addr=${me}: ${(err as Error)?.message ?? err}`,
+        `[sse:channel] stream broken channel=${channelId} addr=${logAddr(me)}: ${(err as Error)?.message ?? err}`,
       );
     } finally {
       aborted = true;
@@ -575,7 +775,12 @@ signalRoutes.get("/signals/feed/stream", async (c) => {
 
   return streamSSE(c, async (stream) => {
     let aborted = false;
-    const queue: (SignalEvent & ChannelMeta)[] = [];
+    // queue carries enriched events: channel-scope events get channel meta
+    // merged in; user-scope events (friend_*, channel_invited/created) come
+    // through without channel-meta enrichment (they aren't tied to a single
+    // existing channel in the user's view).
+    type EnrichedEvent = Event & Partial<FeedStreamMeta>;
+    const queue: EnrichedEvent[] = [];
     let resolveWaiter: (() => void) | null = null;
 
     function wakeWaiter() {
@@ -586,8 +791,12 @@ signalRoutes.get("/signals/feed/stream", async (c) => {
 
     const unsubs: Array<() => void> = [];
     let ejected: { channel_id: string; reason: string } | null = null;
-    for (const [channel_id, meta] of channelMeta) {
-      unsubs.push(subscribe(channel_id, me, (evt) => {
+
+    // Channel-scope subscription factory. Used for snapshot subscribe at
+    // connect time AND for dynamic subscribe via the extender (when the user
+    // joins a new channel mid-stream — see G v0.0.6 review #1 fix).
+    function subscribeChannel(channel_id: string, meta: FeedStreamMeta) {
+      unsubs.push(subscribe(`chan:${channel_id}`, me, (evt) => {
         if ((evt as EjectEvent).__close) {
           // Drop the dead channel from our local meta cache and (importantly)
           // STOP enriching new events for it. Don't kill the whole stream —
@@ -597,14 +806,41 @@ signalRoutes.get("/signals/feed/stream", async (c) => {
           wakeWaiter();
           return;
         }
-        // Enrich each event with the channel's display metadata so the
-        // client can render labels consistently with /signals/feed history.
-        // Also cap payload size to match /signals/feed history behavior.
-        const e = evt as SignalEvent;
-        queue.push({ ...e, payload: truncatePayloadForFeed(e.payload), ...meta });
+        const e = evt as Event;
+        // Cap payload only for SignalEvent (other events have small fixed
+        // shapes — no need to truncate). Merge channel meta for client
+        // rendering consistency.
+        const payload = e.kind === "signal"
+          ? truncatePayloadForFeed((e as SignalEvent).payload)
+          : "payload" in e ? e.payload : undefined;
+        queue.push({ ...e, ...(payload !== undefined ? { payload } : {}), ...meta });
         wakeWaiter();
       }));
     }
+
+    // 1) snapshot subscribe — every channel the user is a member of NOW.
+    for (const [channel_id, meta] of channelMeta) {
+      subscribeChannel(channel_id, meta);
+    }
+
+    // 2) user-scope subscribe — friend_request / friend_accepted /
+    //    friend_removed / channel_invited / channel_created come through
+    //    here regardless of channel membership snapshot.
+    unsubs.push(subscribe(`user:${me}`, me, (evt) => {
+      if ((evt as EjectEvent).__close) return;  // user-scope can't be ejected
+      queue.push(evt as Event);
+      wakeWaiter();
+    }));
+
+    // 3) register extender — when route handlers create / join a channel
+    //    for `me` mid-stream, add a live channel subscription so this
+    //    feed-stream sees signals from it without requiring reconnect.
+    const unregExtender = registerFeedStreamExtender(me, (newChannelId, newMeta) => {
+      if (channelMeta.has(newChannelId)) return;  // already subscribed
+      channelMeta.set(newChannelId, newMeta);
+      subscribeChannel(newChannelId, newMeta);
+    });
+    unsubs.push(unregExtender);
 
     // Heartbeat: 10s. Some intermediaries (browser proxies, mobile carrier
     // NATs, fly.io edge) drop idle conns at <30s windows. 25s left a thin
@@ -639,17 +875,27 @@ signalRoutes.get("/signals/feed/stream", async (c) => {
         }
         while (queue.length > 0 && !aborted) {
           const evt = queue.shift()!;
+          // SSE event name = our `kind`; id = signal_id when present
+          // (signal/reaction), else channel_id, else "" (friend_request has
+          // no channel yet — use request_id).
+          const eventName = evt.kind;
+          const id =
+            "signal_id" in evt ? (evt as any).signal_id :
+            "channel_id" in evt && (evt as any).channel_id ? (evt as any).channel_id :
+            "request_id" in evt ? (evt as any).request_id :
+            "";
           await stream.writeSSE({
-            id: evt.signal_id,
-            event: "signal",
+            id,
+            event: eventName,
             data: JSON.stringify(evt),
           });
         }
       }
     } catch (err) {
       // BETA-1.b: surface stream death cause; see channel handler for rationale.
+      // Address logged truncated per ADR (no full pubkey in logs).
       console.warn(
-        `[sse:feed] stream broken addr=${me}: ${(err as Error)?.message ?? err}`,
+        `[sse:feed] stream broken addr=${logAddr(me)}: ${(err as Error)?.message ?? err}`,
       );
     } finally {
       aborted = true;
@@ -704,17 +950,41 @@ signalRoutes.post("/signals/:id/reactions", async (c) => {
         reactionId: row.reaction_id,
         callType: "reaction_push",
       });
+      // Look up @handle so SSE consumers can render directly without a
+      // second DB hop. Same pattern as signal-push above.
+      const u = await tx<{ username: string | null }[]>`
+        SELECT username FROM identities WHERE address = ${me}
+      `;
+      const from_username = u[0]?.username ?? null;
       return {
         reaction_id: row.reaction_id,
         signal_id: signalId,
         channel_id: sig.channel_id,
         from_address: me,
+        from_username,
         payload,
         is_auto: isAuto,
         created_at: row.created_at.toISOString(),
         cost_usd: meterOut.cost_usd,
       };
     });
+
+    // BETA-1.c: broadcast reaction so anyone watching this channel sees
+    // "@bob reacted to @alice's signal" without polling. Was the #1 watch
+    // observability gap before this release (channel watchers saw signals
+    // pushed but had no idea if anyone reacted).
+    publishChannel(result.channel_id, {
+      kind: "reaction",
+      reaction_id: result.reaction_id,
+      signal_id: result.signal_id,
+      channel_id: result.channel_id,
+      from_address: me,
+      from_username: result.from_username,
+      payload: result.payload,
+      is_auto: result.is_auto,
+      created_at: result.created_at,
+    });
+
     const allowance_after = await buildAllowanceResponse(me);
     recordEvent({ type: "reaction_push", address: me, channelId: result.channel_id, payload: { is_auto: isAuto } });
     return c.json({ ...result, allowance_after }, 201);

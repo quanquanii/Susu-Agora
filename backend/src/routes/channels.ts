@@ -25,7 +25,12 @@ import {
 import { parseJsonBody, invalidJson } from "../lib/http.ts";
 import { check as rateCheck, RateLimitedError } from "../lib/rate_limit.ts";
 import { recordEvent } from "../lib/events.ts";
-import { ejectAddressFromChannel } from "./signals.ts";
+import {
+  ejectAddressFromChannel,
+  publishChannel,
+  publishUser,
+  notifyFeedStreamsNewChannel,
+} from "./signals.ts";
 
 const MAX_CHANNELS_PER_ADDRESS = 5;
 const INVITE_PER_ADDR = { windowMs: 60_000, max: 30 };
@@ -84,6 +89,18 @@ channelRoutes.post("/channels", async (c) => {
       return id;
     });
     recordEvent({ type: "channel_create", address: me, channelId, payload: { is_group: true, has_name: !!name } });
+    // BETA-1.c: surface the new channel to creator's live feed-stream so they
+    // see it without reconnect, and broadcast a `channel_created` user-scope
+    // event so the inbox UI can highlight it.
+    const createdAt = new Date().toISOString();
+    publishUser(me, {
+      kind: "channel_created",
+      channel_id: channelId,
+      is_group: true,
+      name,
+      created_at: createdAt,
+    });
+    notifyFeedStreamsNewChannel(me, channelId, { channel_name: name, peer: null });
     return c.json({ channel_id: channelId, owner: me, is_group: true }, 201);
   } catch (e) {
     if (e instanceof HttpError) return c.json({ error: e.reason }, e.status as 409);
@@ -141,6 +158,9 @@ channelRoutes.post("/channels/:id/invite", async (c) => {
     throw e;
   }
 
+  let channelName: string | null = null;
+  let targetUsername: string | null = null;
+  let inviterUsername: string | null = null;
   try {
     await sql.begin(async (tx) => {
       const isGroup = await isGroupChannel(tx, channelId);
@@ -158,12 +178,47 @@ channelRoutes.post("/channels/:id/invite", async (c) => {
         RETURNING address
       `;
       if (ins.length === 0) throw new HttpError(409, "already a member");
+      // Fetch display info for SSE event payloads (one trip, in-tx).
+      const chRow = await tx<{ name: string | null }[]>`
+        SELECT name FROM channels WHERE channel_id = ${channelId}
+      `;
+      channelName = chRow[0]?.name ?? null;
+      const ids = await tx<{ address: string; username: string | null }[]>`
+        SELECT address, username FROM identities
+        WHERE address IN (${target}, ${me})
+      `;
+      for (const r of ids) {
+        if (r.address === target) targetUsername = r.username;
+        if (r.address === me) inviterUsername = r.username;
+      }
     });
   } catch (e) {
     if (e instanceof HttpError) return c.json({ error: e.reason }, e.status as 403 | 404 | 409 | 400);
     throw e;
   }
   recordEvent({ type: "channel_invite", address: me, channelId });
+  // BETA-1.c: broadcast member-add to existing channel members so anyone
+  // watching sees "@bob just joined", and notify the invitee's user-scope
+  // feed-stream so their inbox lights up. Also wire dynamic subscribe so
+  // their live feed-stream starts seeing this channel's signals.
+  const createdAt = new Date().toISOString();
+  publishChannel(channelId, {
+    kind: "channel_member_added",
+    channel_id: channelId,
+    address: target,
+    username: targetUsername,
+    by: me,
+    created_at: createdAt,
+  });
+  publishUser(target, {
+    kind: "channel_invited",
+    channel_id: channelId,
+    by: me,
+    by_username: inviterUsername,
+    channel_name: channelName,
+    created_at: createdAt,
+  });
+  notifyFeedStreamsNewChannel(target, channelId, { channel_name: channelName, peer: null });
   return c.json({ ok: true, channel_id: channelId, added: target });
 });
 
@@ -220,6 +275,36 @@ channelRoutes.post("/channels/:id/leave", async (c) => {
   if (!result.was_1on1 && result.ownerHandover) {
     recordEvent({ type: "owner_auto_elected", address: me, channelId, payload: { handed_to_hash: undefined /* avoid extra hashing inside lib */ } });
   }
+  // BETA-1.c: broadcast leave so remaining channel members see member list
+  // shrink in their watch/feed. Also broadcast owner-transfer if D7 v0.6
+  // auto-election kicked in. Order matters: send removed BEFORE we close
+  // `me`'s own subscription (the channel pubsub map still has `me` here).
+  const createdAt = new Date().toISOString();
+  if (!result.was_1on1) {
+    // Look up `me`'s username for member_removed payload.
+    const u = await sql<{ username: string | null }[]>`
+      SELECT username FROM identities WHERE address = ${me}
+    `;
+    publishChannel(channelId, {
+      kind: "channel_member_removed",
+      channel_id: channelId,
+      address: me,
+      username: u[0]?.username ?? null,
+      by: null,           // self-leave
+      reason: "left",
+      created_at: createdAt,
+    });
+    if (result.ownerHandover) {
+      publishChannel(channelId, {
+        kind: "channel_owner_transferred",
+        channel_id: channelId,
+        from_address: me,
+        to_address: result.ownerHandover,
+        reason: "auto_elected_on_leave",
+        created_at: createdAt,
+      });
+    }
+  }
   // Close any active SSE subscription `me` has on this channel. For 1-on-1
   // we also need to close the counterpart's subscription because the channel
   // no longer exists (CASCADE deleted), but we don't know the counterpart's
@@ -267,6 +352,21 @@ channelRoutes.post("/channels/:id/kick", async (c) => {
     if (e instanceof HttpError) return c.json({ error: e.reason }, e.status as 400 | 403 | 404 | 409);
     throw e;
   }
+  // BETA-1.c: broadcast removal to remaining channel members so their watch
+  // sees "@bob was kicked by @alice". Send BEFORE eject so the channel's
+  // pubsub map still routes; eject removes only the kicked user's own sub.
+  const tu = await sql<{ username: string | null }[]>`
+    SELECT username FROM identities WHERE address = ${target}
+  `;
+  publishChannel(channelId, {
+    kind: "channel_member_removed",
+    channel_id: channelId,
+    address: target,
+    username: tu[0]?.username ?? null,
+    by: me,
+    reason: "kicked",
+    created_at: new Date().toISOString(),
+  });
   // Close any active SSE subscription that the kicked user has on THIS
   // channel. Without this, their open `susu watch` / `susu feed -f` keeps
   // streaming new messages — real data leak (G v0.0.4 review #2).
@@ -311,6 +411,14 @@ channelRoutes.post("/channels/:id/transfer-owner", async (c) => {
     throw e;
   }
   recordEvent({ type: "transfer_owner", address: me, channelId });
+  publishChannel(channelId, {
+    kind: "channel_owner_transferred",
+    channel_id: channelId,
+    from_address: me,
+    to_address: candidate,
+    reason: "transfer",
+    created_at: new Date().toISOString(),
+  });
   return c.json({ ok: true, channel_id: channelId, new_owner: candidate });
 });
 
@@ -361,6 +469,14 @@ channelRoutes.put("/channels/:id/meta", async (c) => {
   });
   if ("error" in result) return c.json(result.error.body, result.error.status as 403 | 404 | 409);
   recordEvent({ type: "channel_meta_update", address: me, channelId, payload: { method: "PUT", size_bytes: serialized.length } });
+  publishChannel(channelId, {
+    kind: "channel_meta_changed",
+    channel_id: channelId,
+    by: me,
+    method: "PUT",
+    size_bytes: serialized.length,
+    created_at: new Date().toISOString(),
+  });
   return c.json({ ok: true });
 });
 
@@ -386,5 +502,12 @@ channelRoutes.patch("/channels/:id/meta", async (c) => {
   });
   if ("error" in result) return c.json(result.error.body, result.error.status as 403 | 404 | 409);
   recordEvent({ type: "channel_meta_update", address: me, channelId, payload: { method: "PATCH" } });
+  publishChannel(channelId, {
+    kind: "channel_meta_changed",
+    channel_id: channelId,
+    by: me,
+    method: "PATCH",
+    created_at: new Date().toISOString(),
+  });
   return c.json({ ok: true });
 });

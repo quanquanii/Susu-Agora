@@ -16,7 +16,11 @@ import { sql } from "../db.ts";
 import { authedAddress, AuthError, isValidSolanaAddress } from "../auth.ts";
 import { parseJsonBody, invalidJson } from "../lib/http.ts";
 import { recordEvent, hashAddress } from "../lib/events.ts";
-import { ejectAddressFromChannel } from "./signals.ts";
+import {
+  ejectAddressFromChannel,
+  publishUser,
+  notifyFeedStreamsNewChannel,
+} from "./signals.ts";
 
 export const friendRoutes = new Hono();
 
@@ -91,6 +95,12 @@ friendRoutes.post("/friends/add", async (c) => {
     });
   }
 
+  // Need my @handle to surface in publishUser events sent to target.
+  const myRow = await sql<{ username: string | null }[]>`
+    SELECT username FROM identities WHERE address = ${me}
+  `;
+  const myUsername = myRow[0]?.username ?? null;
+
   // If target has auto_accept_friends=true → create channel + link in one tx.
   if (target.auto_accept_friends) {
     const result = await sql.begin(async (tx) => {
@@ -109,6 +119,35 @@ friendRoutes.post("/friends/add", async (c) => {
       return { channel_id };
     });
     recordEvent({ type: "friend_add_accepted", address: me, channelId: result.channel_id, payload: { auto: true } });
+    // BETA-1.c: tell BOTH sides' user-scope feed-streams + dynamically wire
+    // their existing feed-stream subscribers to the new 1-on-1 channel
+    // (G v0.0.6 review #1 fix). Without these notifies, users would have to
+    // reconnect to see the new friend appear / receive its first messages.
+    const createdAt = new Date().toISOString();
+    publishUser(me, {
+      kind: "friend_accepted",
+      channel_id: result.channel_id,
+      with_address: target.address,
+      with_username: target.username,
+      auto: true,
+      created_at: createdAt,
+    });
+    publishUser(target.address, {
+      kind: "friend_accepted",
+      channel_id: result.channel_id,
+      with_address: me,
+      with_username: myUsername,
+      auto: true,
+      created_at: createdAt,
+    });
+    notifyFeedStreamsNewChannel(me, result.channel_id, {
+      channel_name: null,
+      peer: { address: target.address, username: target.username },
+    });
+    notifyFeedStreamsNewChannel(target.address, result.channel_id, {
+      channel_name: null,
+      peer: { address: me, username: myUsername },
+    });
     return c.json({
       status: "added",
       channel_id: result.channel_id,
@@ -122,6 +161,15 @@ friendRoutes.post("/friends/add", async (c) => {
     RETURNING request_id
   `;
   recordEvent({ type: "friend_add_request", address: me, payload: {} });
+  // Notify target's user-scope feed-stream so their inbox UI lights up
+  // ("@alice wants to connect — accept?").
+  publishUser(target.address, {
+    kind: "friend_request",
+    request_id: inserted[0]!.request_id,
+    from_address: me,
+    from_username: myUsername,
+    created_at: new Date().toISOString(),
+  });
   return c.json({
     status: "pending",
     request_id: inserted[0]!.request_id,
@@ -162,6 +210,36 @@ friendRoutes.post("/friends/accept", async (c) => {
 
   if ("error" in result) return c.json({ error: result.error }, 404);
   recordEvent({ type: "friend_add_accepted", address: me, channelId: result.channel_id, payload: { auto: false } });
+  // BETA-1.c: notify both sides + dynamically wire feed-streams.
+  const myRow = await sql<{ username: string | null }[]>`
+    SELECT username FROM identities WHERE address = ${me}
+  `;
+  const myUsername = myRow[0]?.username ?? null;
+  const createdAt = new Date().toISOString();
+  publishUser(me, {
+    kind: "friend_accepted",
+    channel_id: result.channel_id,
+    with_address: from.address,
+    with_username: from.username,
+    auto: false,
+    created_at: createdAt,
+  });
+  publishUser(from.address, {
+    kind: "friend_accepted",
+    channel_id: result.channel_id,
+    with_address: me,
+    with_username: myUsername,
+    auto: false,
+    created_at: createdAt,
+  });
+  notifyFeedStreamsNewChannel(me, result.channel_id, {
+    channel_name: null,
+    peer: { address: from.address, username: from.username },
+  });
+  notifyFeedStreamsNewChannel(from.address, result.channel_id, {
+    channel_name: null,
+    peer: { address: me, username: myUsername },
+  });
   return c.json({ status: "accepted", channel_id: result.channel_id, friend: { address: from.address, username: from.username } }, 201);
 });
 
@@ -193,6 +271,19 @@ friendRoutes.post("/friends/remove", async (c) => {
   ejectAddressFromChannel(result.channel_id, me, "unfriended");
   ejectAddressFromChannel(result.channel_id, target.address, "unfriended");
   recordEvent({ type: "friend_remove", address: me, channelId: result.channel_id });
+  // BETA-1.c: tell the ex-friend's user-scope feed-stream so their inbox
+  // shows "@me unfriended you, channel removed". The eject above closes
+  // their channel-scope sub but doesn't tell their user-scope sub anything.
+  const myRow = await sql<{ username: string | null }[]>`
+    SELECT username FROM identities WHERE address = ${me}
+  `;
+  publishUser(target.address, {
+    kind: "friend_removed",
+    by_address: me,
+    by_username: myRow[0]?.username ?? null,
+    channel_id: result.channel_id,
+    created_at: new Date().toISOString(),
+  });
   return c.json({ status: "removed", channel_id: result.channel_id });
 });
 
