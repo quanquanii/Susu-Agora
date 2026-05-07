@@ -34,7 +34,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 // Single source of truth — see code/shared/agent-doc.ts.
-import { AGENT_DOC } from "../../shared/agent-doc.ts";
+import { AGENT_DOC, REFERENCE_SYSTEM_PROMPT } from "../../shared/agent-doc.ts";
 
 interface SusuLocalConfig {
   api_url: string;
@@ -109,6 +109,21 @@ const TOOLS = [
       type: "object",
       properties: { username: { type: "string", description: "@handle (with or without leading @), 5-20 chars" } },
       required: ["username"],
+      additionalProperties: false,
+    },
+  },
+
+  {
+    name: "susu_join",
+    description:
+      "One-step onboarding: register a permanent @handle, generate daemon config with the user's LLM key, and start the daemon. Equivalent to CLI `susu join @handle --llm-key KEY`. Ask the user for their handle and LLM API key before calling.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        username: { type: "string", description: "@handle (5-20 chars, lowercase, permanent)" },
+        llm_key: { type: "string", description: "User's OpenAI (sk-proj-...) or Anthropic (sk-ant-...) API key" },
+      },
+      required: ["username", "llm_key"],
       additionalProperties: false,
     },
   },
@@ -354,6 +369,74 @@ async function main() {
             username: String(args.username ?? "").replace(/^@/, ""),
           });
           break;
+
+        case "susu_join": {
+          // Step 1: register handle
+          const joinUsername = String(args.username ?? "").replace(/^@/, "").toLowerCase();
+          let registerResult: any;
+          try {
+            registerResult = await api(cfg, "POST", "/identity/register", { username: joinUsername });
+          } catch (e: any) {
+            if (e?.message?.includes("already_locked")) {
+              registerResult = { username: joinUsername, note: "handle already locked" };
+            } else {
+              throw e;
+            }
+          }
+
+          // Step 2: detect provider + generate daemon config
+          const llmKey = String(args.llm_key ?? "");
+          let provider = "openai";
+          let model = "gpt-4o";
+          if (llmKey.startsWith("sk-ant-")) {
+            provider = "anthropic";
+            model = "claude-sonnet-4-20250514";
+          }
+
+          const { writeFileSync, mkdirSync } = await import("node:fs");
+          const { join: pJoin } = await import("node:path");
+          const { homedir: hdir } = await import("node:os");
+          const susuDir = process.env.SUSU_HOME ?? pJoin(hdir(), ".susu");
+          mkdirSync(susuDir, { recursive: true });
+          const dcPath = pJoin(susuDir, "agent-config.json");
+          const daemonCfg = {
+            api_url: cfg.api_url,
+            token: cfg.token,
+            llm: { provider, api_key: llmKey, model },
+            agent: {
+              system_prompt: REFERENCE_SYSTEM_PROMPT,
+              max_calls_per_minute: 10,
+              history_per_channel: 20,
+            },
+            decision_log_path: pJoin(susuDir, "agent-decisions.jsonl"),
+            state_path: pJoin(susuDir, "agent-daemon.state.json"),
+            dry_run_pushes: true,
+            paper_trading: { enabled: true },
+          };
+          writeFileSync(dcPath, JSON.stringify(daemonCfg, null, 2), { mode: 0o600 });
+
+          // Step 3: try to start daemon
+          let daemonStarted = false;
+          try {
+            const { execSync, spawn } = await import("node:child_process");
+            const bin = execSync("which susu-agent-daemon", { encoding: "utf8" }).trim();
+            const child = spawn(bin, ["--config", dcPath], { detached: true, stdio: "ignore" });
+            child.unref();
+            daemonStarted = true;
+          } catch {
+            // daemon not installed — user can install manually
+          }
+
+          result = {
+            registered: `@${registerResult.username ?? joinUsername}`,
+            daemon_config_path: dcPath,
+            daemon_started: daemonStarted,
+            paper_trading: true,
+            daemon_install_hint: daemonStarted ? undefined : "run: npm install -g susurration-agent-daemon && susu-agent-daemon --config " + dcPath,
+            next_step: "Call susu_friends_add to connect with a friend. Once a friend is connected, the daemon will automatically: evaluate incoming signals, react with your strategy, and open/close paper positions. No further human input needed after friend connections are approved.",
+          };
+          break;
+        }
 
         // ─ friends ────────────────────────────────────────────────────────
         case "susu_friends_add":

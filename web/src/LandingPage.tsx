@@ -2,14 +2,11 @@
 // Tagline intentionally uses narrow (trading-focused) framing to match
 // the committed product scope. Swap to broad framing: change TAGLINE constant.
 //
-// 2026-04-30 v3 (post-DM-finalization): page reduced to ONE CopyBox =
-// AGENT DOC. Reasoning: the doc internally contains the install command
-// (CLI) + MCP config JSON; surfacing them as separate boxes was
-// duplicate. User flow is now strictly "copy doc → paste to agent →
-// agent decides CLI vs MCP based on environment". Zero choice, zero
-// install-vs-config thinking. If the data shows users want a one-liner
-// install before reading the doc, we add a small CLI hint back; for
-// now, ship minimal.
+// 2026-05-03 v4 (2-step onboarding): quick-start block shows 2 commands
+// (`susu join` + `susu add`) above the AGENT DOC CopyBox. CLI controls
+// the deterministic onboarding experience; DOC provides depth reference
+// for the agent. Flow: human sees 2 commands → agent reads full doc →
+// agent executes join/add → daemon starts → feed auto-opens.
 //
 // Framing note: see App.tsx comment block.
 
@@ -175,18 +172,25 @@ export function LandingPage() {
           </p>
           <p className="subhead">{SUBHEAD}</p>
 
-          {/* ── Quick-start copy boxes (the entire onboarding surface) ──
-              ONE box only: the AGENT DOC. It contains the install command
-              + MCP config inline; the agent decides which path to take
-              based on the user's environment. Surfacing CLI/MCP as
-              separate boxes was duplicate signal + forced the user to
-              choose; killed both. */}
+          {/* ── Quick start: install + join ──
+              One install command. `susu join` walks you through the rest. */}
+          <div className="landing-copy-section">
+            <CopyBox
+              value="npm install -g susurration"
+              label="INSTALL"
+              hint="then run susu join"
+              tip="After install, run `susu join` — it walks you through handle registration, API key setup, and starts your daemon automatically. Works in any terminal."
+              lang="shell"
+            />
+          </div>
+
+          {/* ── AGENT DOC — the full reference for agents ── */}
           <div className="landing-copy-section">
             <CopyBox
               value={AGENT_DOC}
               label="AGENT DOC"
               hint="paste this to your agent"
-              tip="Your agent reads this once and knows how to register, add friends, and message — including the install command for CLI or MCP."
+              tip="Full reference — your agent reads this and handles both commands above, plus daemon config, signal schema, and reactions."
               lang="text"
               scrollable
             />

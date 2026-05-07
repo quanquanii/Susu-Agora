@@ -6086,7 +6086,7 @@ var require_abort_controller = __commonJS((exports, module) => {
   Object.defineProperty(exports, "__esModule", { value: true });
   var eventTargetShim = require_event_target_shim();
 
-  class AbortSignal extends eventTargetShim.EventTarget {
+  class AbortSignal2 extends eventTargetShim.EventTarget {
     constructor() {
       super();
       throw new TypeError("AbortSignal cannot be constructed directly");
@@ -6099,9 +6099,9 @@ var require_abort_controller = __commonJS((exports, module) => {
       return aborted;
     }
   }
-  eventTargetShim.defineEventAttribute(AbortSignal.prototype, "abort");
+  eventTargetShim.defineEventAttribute(AbortSignal2.prototype, "abort");
   function createAbortSignal() {
-    const signal = Object.create(AbortSignal.prototype);
+    const signal = Object.create(AbortSignal2.prototype);
     eventTargetShim.EventTarget.call(signal);
     abortedFlags.set(signal, false);
     return signal;
@@ -6114,11 +6114,11 @@ var require_abort_controller = __commonJS((exports, module) => {
     signal.dispatchEvent({ type: "abort" });
   }
   var abortedFlags = new WeakMap;
-  Object.defineProperties(AbortSignal.prototype, {
+  Object.defineProperties(AbortSignal2.prototype, {
     aborted: { enumerable: true }
   });
   if (typeof Symbol === "function" && typeof Symbol.toStringTag === "symbol") {
-    Object.defineProperty(AbortSignal.prototype, Symbol.toStringTag, {
+    Object.defineProperty(AbortSignal2.prototype, Symbol.toStringTag, {
       configurable: true,
       value: "AbortSignal"
     });
@@ -6154,11 +6154,11 @@ var require_abort_controller = __commonJS((exports, module) => {
     });
   }
   exports.AbortController = AbortController2;
-  exports.AbortSignal = AbortSignal;
+  exports.AbortSignal = AbortSignal2;
   exports.default = AbortController2;
   module.exports = AbortController2;
   module.exports.AbortController = module.exports["default"] = AbortController2;
-  module.exports.AbortSignal = AbortSignal;
+  module.exports.AbortSignal = AbortSignal2;
 });
 
 // node_modules/node-domexception/index.js
@@ -6283,8 +6283,10 @@ var init_fileFromPath = __esm(() => {
 });
 
 // src/index.ts
-import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { dirname } from "node:path";
+import { readFile, writeFile, appendFile as appendFile2, mkdir } from "node:fs/promises";
+import { unlinkSync, readFileSync as readFileSync2 } from "node:fs";
+import { dirname as dirname2, join } from "node:path";
+import { spawn } from "node:child_process";
 
 // node_modules/@anthropic-ai/sdk/version.mjs
 var VERSION = "0.32.1";
@@ -14829,14 +14831,14 @@ var TOOL_REACT = {
             type: "number",
             minimum: 0.1,
             maximum: 1,
-            description: "Optional. How much of the peer's size you'd take (1.0 = full, 0.5 = half). Use lower values when partially agreeing or when value=-1 to signal the small residual conviction."
+            description: "REQUIRED. Your conviction level: 1.0 = full size, 0.5 = half, 0.3 = minimum. Always provide — paper trading uses this to size positions."
           },
           note: {
             type: "string",
-            description: "Optional. ≤15 words explaining the stance to the peer (separate from `reason` which is your private decision log)."
+            description: "≤15 words explaining the stance to the peer (separate from `reason` which is your private decision log)."
           }
         },
-        required: ["value"],
+        required: ["value", "size_factor"],
         additionalProperties: true
       },
       reason: { type: "string", description: "Brief reasoning visible only in YOUR decision log (peer doesn't see this)." }
@@ -14911,9 +14913,9 @@ class AnthropicProvider {
 class OpenAIProvider {
   model;
   client;
-  constructor(apiKey, model) {
+  constructor(apiKey, model, baseURL) {
     this.model = model;
-    this.client = new openai_default({ apiKey });
+    this.client = new openai_default({ apiKey, ...baseURL ? { baseURL } : {} });
   }
   async decide(ctx, systemPrompt) {
     const startedAt = Date.now();
@@ -15091,6 +15093,327 @@ function formatDecision(d2) {
   }
 }
 
+// src/paper_trading.ts
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+var DEFAULT_LEVERAGE = 3;
+var DEFAULT_POSITION_PCT = 30;
+var DEFAULT_SL_PCT = 0.08;
+var DEFAULT_TP_PCT = 0.12;
+var DEFAULT_TIME_STOP_HOURS = 48;
+var DEFAULT_TRAILING_ACTIVATE = 15;
+var DEFAULT_TRAILING_GIVEBACK = 50;
+var DEFAULT_INITIAL_BALANCE = 100;
+var TRACK_INTERVAL_MS = 60000;
+async function fetchPrices(symbols) {
+  const out = new Map;
+  if (symbols.size === 0)
+    return out;
+  try {
+    const resp = await fetch("https://fapi.binance.com/fapi/v1/ticker/price", {
+      signal: AbortSignal.timeout(1e4)
+    });
+    const data = await resp.json();
+    for (const d2 of data) {
+      if (symbols.has(d2.symbol))
+        out.set(d2.symbol, parseFloat(d2.price));
+    }
+  } catch (err) {
+    process.stderr.write(`[paper] price fetch error: ${err?.message ?? err}
+`);
+  }
+  return out;
+}
+
+class PaperTrader {
+  tradesPath;
+  minSizeFactor;
+  maxOpen;
+  eventLogPath;
+  trackTimer = null;
+  constructor(tradesPath, minSizeFactor = 0.5, maxOpen = Infinity, eventLogPath) {
+    this.tradesPath = tradesPath;
+    this.minSizeFactor = minSizeFactor;
+    this.maxOpen = maxOpen;
+    this.eventLogPath = eventLogPath;
+    mkdirSync(dirname(tradesPath), { recursive: true });
+  }
+  emitEvent(evt) {
+    if (!this.eventLogPath)
+      return;
+    try {
+      appendFileSync(this.eventLogPath, JSON.stringify(evt) + `
+`, "utf8");
+    } catch {}
+  }
+  startTracking() {
+    this.trackPositions();
+    this.trackTimer = setInterval(() => this.trackPositions(), TRACK_INTERVAL_MS);
+  }
+  stopTracking() {
+    if (this.trackTimer) {
+      clearInterval(this.trackTimer);
+      this.trackTimer = null;
+    }
+  }
+  onDecision(decision, trigger) {
+    if (decision?.kind !== "react")
+      return;
+    const p2 = decision.payload ?? {};
+    if (p2.value !== "+1")
+      return;
+    const sf = typeof p2.size_factor === "number" ? p2.size_factor : 0.7;
+    if (sf < this.minSizeFactor) {
+      const peer2 = trigger?.from_username ?? "?";
+      const token2 = trigger?.payload?.token ?? "?";
+      process.stderr.write(`[paper] skip react +1 ${token2} from ${peer2}: size_factor ${sf} < min ${this.minSizeFactor}
+`);
+      this.emitEvent({ kind: "paper_skip", ts: new Date().toISOString(), reason: `size_factor ${sf} < min ${this.minSizeFactor}`, token: token2, peer: peer2, sf });
+      return;
+    }
+    const sigPayload = trigger?.payload ?? {};
+    const token = sigPayload.token;
+    const direction = sigPayload.direction ?? "long";
+    if (direction !== "long" && direction !== "short") {
+      const peer2 = trigger?.from_username ?? "?";
+      process.stderr.write(`[paper] skip react +1 ${token ?? "?"} from ${peer2}: direction="${direction}" (must be long or short)
+`);
+      this.emitEvent({ kind: "paper_skip", ts: new Date().toISOString(), reason: `direction="${direction}" not supported`, token: token ?? "?", peer: peer2 });
+      return;
+    }
+    const peer = trigger?.from_username ?? "?";
+    if (!token) {
+      process.stderr.write(`[paper] skip react +1 from ${peer}: missing token in signal payload
+`);
+      this.emitEvent({ kind: "paper_skip", ts: new Date().toISOString(), reason: "missing token in signal payload", token: "?", peer });
+      return;
+    }
+    const book = this.loadBook();
+    if (book.trades.some((t2) => t2.token === token && t2.status === "open")) {
+      process.stderr.write(`[paper] skip react +1 ${token} from ${peer}: already open
+`);
+      this.emitEvent({ kind: "paper_skip", ts: new Date().toISOString(), reason: "already open", token, peer });
+      return;
+    }
+    const openCount = book.trades.filter((t2) => t2.status === "open").length;
+    if (openCount >= this.maxOpen) {
+      process.stderr.write(`[paper] skip react +1 ${token} from ${peer}: max open positions (${this.maxOpen})
+`);
+      this.emitEvent({ kind: "paper_skip", ts: new Date().toISOString(), reason: `max open positions (${this.maxOpen})`, token, peer });
+      return;
+    }
+    const meta = sigPayload.metadata ?? {};
+    const leverage = meta.leverage ?? DEFAULT_LEVERAGE;
+    const entryPrice = meta.entry_price;
+    if (!entryPrice || typeof entryPrice !== "number" || entryPrice <= 0) {
+      process.stderr.write(`[paper] skip react +1 ${token} from ${peer}: no valid entry_price in metadata
+`);
+      this.emitEvent({ kind: "paper_skip", ts: new Date().toISOString(), reason: "no valid entry_price in metadata", token, peer });
+      return;
+    }
+    const isShort = direction === "short";
+    const slPct = meta.stop_loss ? Math.abs(meta.stop_loss - entryPrice) / entryPrice : DEFAULT_SL_PCT;
+    const tpPct = meta.take_profit ? Math.abs(meta.take_profit - entryPrice) / entryPrice : DEFAULT_TP_PCT;
+    const balance = this.getBalance(book);
+    const posPct = (meta.position_pct ?? DEFAULT_POSITION_PCT) * sf;
+    const posUsd = balance * posPct / 100;
+    const id = String(book.trades.length + 1).padStart(3, "0");
+    const trade = {
+      id,
+      token,
+      direction,
+      leverage,
+      position_pct: Math.round(posPct * 100) / 100,
+      position_usd: Math.round(posUsd * 1e4) / 1e4,
+      notional_usd: Math.round(posUsd * leverage * 1e4) / 1e4,
+      entry_price: entryPrice,
+      stop_loss: meta.stop_loss ?? Math.round(entryPrice * (isShort ? 1 + slPct : 1 - slPct) * 1e8) / 1e8,
+      take_profit: meta.take_profit ?? Math.round(entryPrice * (isShort ? 1 - tpPct : 1 + tpPct) * 1e8) / 1e8,
+      time_stop_hours: meta.time_stop_hours ?? DEFAULT_TIME_STOP_HOURS,
+      trailing_activate_pct: DEFAULT_TRAILING_ACTIVATE,
+      trailing_giveback_pct: DEFAULT_TRAILING_GIVEBACK,
+      best_pnl_pct: 0,
+      size_factor: sf,
+      peer: peer.startsWith("@") ? peer : `@${peer}`,
+      signal_id: decision.signal_id ?? "",
+      opened_at: new Date().toISOString(),
+      exit_price: null,
+      exit_time: null,
+      exit_reason: null,
+      pnl_pct: null,
+      pnl_usd: null,
+      status: "open"
+    };
+    book.trades.push(trade);
+    this.saveBook(book);
+    process.stderr.write(`[paper] OPEN #${id} ${token} ${direction} ${leverage}x sf=${sf} ` + `entry=${entryPrice} SL=${trade.stop_loss} TP=${trade.take_profit} ` + `pos=$${posUsd.toFixed(2)} bal=$${balance.toFixed(2)} from ${trade.peer}
+`);
+    this.emitEvent({
+      kind: "paper_open",
+      ts: trade.opened_at,
+      id: trade.id,
+      token,
+      direction,
+      leverage,
+      entry_price: entryPrice,
+      stop_loss: trade.stop_loss,
+      take_profit: trade.take_profit,
+      position_usd: trade.position_usd,
+      size_factor: sf,
+      peer: trade.peer,
+      balance
+    });
+  }
+  async checkOnce() {
+    return this.trackPositions();
+  }
+  async trackPositions() {
+    const book = this.loadBook();
+    const openTrades = book.trades.filter((t2) => t2.status === "open");
+    if (openTrades.length === 0)
+      return;
+    const symbols = new Set(openTrades.map((t2) => t2.token));
+    const prices = await fetchPrices(symbols);
+    let dirty = false;
+    for (const t2 of openTrades) {
+      const price = prices.get(t2.token);
+      if (price == null)
+        continue;
+      const isShort = t2.direction === "short";
+      const pnlPct = (isShort ? (t2.entry_price - price) / t2.entry_price : (price - t2.entry_price) / t2.entry_price) * 100 * t2.leverage;
+      if (pnlPct > t2.best_pnl_pct) {
+        t2.best_pnl_pct = Math.round(pnlPct * 100) / 100;
+        dirty = true;
+      }
+      let reason = null;
+      if (isShort ? price >= t2.stop_loss : price <= t2.stop_loss) {
+        reason = "stop_loss";
+      } else if (isShort ? price <= t2.take_profit : price >= t2.take_profit) {
+        reason = "take_profit";
+      } else if (t2.best_pnl_pct >= t2.trailing_activate_pct && pnlPct <= t2.best_pnl_pct * (1 - t2.trailing_giveback_pct / 100)) {
+        reason = "trailing_stop";
+      } else {
+        const ageH = (Date.now() - new Date(t2.opened_at).getTime()) / 3600000;
+        if (ageH >= t2.time_stop_hours) {
+          reason = "time_stop";
+        }
+      }
+      if (reason) {
+        const pnlUsd = Math.round(pnlPct / 100 * t2.position_usd * 1e4) / 1e4;
+        t2.exit_price = price;
+        t2.exit_time = new Date().toISOString();
+        t2.exit_reason = reason;
+        t2.pnl_pct = Math.round(pnlPct * 100) / 100;
+        t2.pnl_usd = pnlUsd;
+        t2.status = "closed";
+        dirty = true;
+        process.stderr.write(`[paper] CLOSE #${t2.id} ${t2.token} ${reason} ` + `exit=${price} pnl=${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}% ` + `($${pnlUsd >= 0 ? "+" : ""}${pnlUsd.toFixed(2)}) ` + `best=${t2.best_pnl_pct >= 0 ? "+" : ""}${t2.best_pnl_pct.toFixed(2)}%
+`);
+        this.emitEvent({
+          kind: "paper_close",
+          ts: t2.exit_time,
+          id: t2.id,
+          token: t2.token,
+          entry_price: t2.entry_price,
+          exit_price: price,
+          exit_reason: reason,
+          pnl_pct: t2.pnl_pct,
+          pnl_usd: pnlUsd,
+          best_pnl_pct: t2.best_pnl_pct,
+          peer: t2.peer
+        });
+      }
+    }
+    if (dirty)
+      this.saveBook(book);
+  }
+  getBalance(book) {
+    let bal = book.initial_balance;
+    for (const t2 of book.trades) {
+      if (t2.status === "closed" && t2.pnl_usd != null)
+        bal += t2.pnl_usd;
+    }
+    return Math.round(bal * 1e4) / 1e4;
+  }
+  loadBook() {
+    try {
+      return JSON.parse(readFileSync(this.tradesPath, "utf8"));
+    } catch {
+      return { initial_balance: DEFAULT_INITIAL_BALANCE, trades: [] };
+    }
+  }
+  saveBook(book) {
+    writeFileSync(this.tradesPath, JSON.stringify(book, null, 2));
+  }
+}
+
+// src/normalize.ts
+var TOP_ALIASES = {
+  symbol: "token",
+  ticker: "token",
+  pair: "token",
+  side: "direction",
+  dir: "direction"
+};
+var META_ALIASES = {
+  sl: "stop_loss",
+  stoploss: "stop_loss",
+  stop: "stop_loss",
+  tp: "take_profit",
+  takeprofit: "take_profit",
+  target: "take_profit",
+  tp2: "take_profit_2",
+  entry: "entry_price",
+  price: "entry_price",
+  lev: "leverage"
+};
+function normalizeSignalPayload(raw) {
+  const warnings = [];
+  const out = { ...raw };
+  for (const [alias, canonical] of Object.entries(TOP_ALIASES)) {
+    if (out[alias] !== undefined && out[canonical] === undefined) {
+      out[canonical] = out[alias];
+      delete out[alias];
+    }
+  }
+  if (out.metadata && typeof out.metadata === "object") {
+    const meta2 = { ...out.metadata };
+    for (const [alias, canonical] of Object.entries(META_ALIASES)) {
+      if (meta2[alias] !== undefined && meta2[canonical] === undefined) {
+        meta2[canonical] = meta2[alias];
+        delete meta2[alias];
+      }
+    }
+    if (meta2.entry_price === undefined && typeof out.entry_price === "number") {
+      meta2.entry_price = out.entry_price;
+    }
+    out.metadata = meta2;
+  } else if (out.entry_price !== undefined || out.stop_loss !== undefined || out.take_profit !== undefined) {
+    const meta2 = {};
+    for (const key of ["entry_price", "stop_loss", "take_profit", "leverage", "time_stop_hours", "position_pct"]) {
+      if (out[key] !== undefined) {
+        meta2[key] = out[key];
+      }
+    }
+    for (const [alias, canonical] of Object.entries(META_ALIASES)) {
+      if (out[alias] !== undefined && meta2[canonical] === undefined) {
+        meta2[canonical] = out[alias];
+      }
+    }
+    if (Object.keys(meta2).length > 0) {
+      out.metadata = meta2;
+    }
+  }
+  if (!out.token) {
+    warnings.push("missing token/symbol");
+  }
+  const meta = out.metadata ?? {};
+  if (!meta.entry_price || typeof meta.entry_price !== "number") {
+    warnings.push("missing metadata.entry_price (paper trading will skip)");
+  }
+  return { payload: out, warnings };
+}
+
 // src/susu_actions.ts
 async function authedFetch(cfg, path, init2) {
   const url = cfg.api_url.replace(/\/$/, "") + path;
@@ -15179,8 +15502,8 @@ Modes:
                            every N minutes. Latency = your scheduler interval.
                            Works on a laptop that sleeps overnight.
 
-Cron example (every 10 min):
-  */10 * * * * /usr/local/bin/susu-agent-daemon --config /home/me/agent.config.json --once
+Cron example (every 2 min — recommended for paper trading):
+  */2 * * * * /usr/local/bin/susu-agent-daemon --config /home/me/agent.config.json --once
 
 
 Config file shape (.json):
@@ -15198,8 +15521,19 @@ Config file shape (.json):
       "history_per_channel": 20
     },
     "decision_log_path": "~/.susu/agent-decisions.jsonl",
-    "dry_run_pushes": true
+    "dry_run_pushes": true,
+    "paper_trading": { "enabled": true }
   }
+
+paper_trading (default: enabled):
+  Built-in paper trading. On react +1 with size_factor >= 0.5, opens a
+  paper position in ~/.susu/paper_trades.json. In-process, zero overhead.
+  Customize min_size_factor (default 0.5) and max_open (default unlimited).
+
+on_decision (optional, for power users):
+  Shell command fired after every decision. JSON context on stdin.
+  Use to bridge to your own trading system (broker API, DEX, webhook).
+  Most users don't need this — paper_trading handles the default case.
 
 Behavior:
   - Subscribes to your /signals/feed/stream over SSE.
@@ -15221,6 +15555,7 @@ async function loadConfig(args) {
   parsed.agent.max_calls_per_minute = parsed.agent.max_calls_per_minute ?? 10;
   parsed.agent.history_per_channel = parsed.agent.history_per_channel ?? 20;
   parsed.state_path = parsed.state_path ?? `${process.env.HOME ?? "."}/.susu/agent-daemon.state.json`;
+  parsed.event_log_path = parsed.event_log_path ?? `${process.env.HOME ?? "."}/.susu/events.jsonl`;
   return parsed;
 }
 async function loadState(path) {
@@ -15232,7 +15567,7 @@ async function loadState(path) {
   }
 }
 async function saveState(path, state) {
-  await mkdir(dirname(path), { recursive: true });
+  await mkdir(dirname2(path), { recursive: true });
   await writeFile(path, JSON.stringify(state, null, 2), "utf8");
 }
 
@@ -15251,13 +15586,31 @@ class MinuteRateLimiter {
     return true;
   }
 }
+var PKG_VERSION = "0.0.6";
+async function checkForUpdate() {
+  try {
+    const resp = await fetch("https://registry.npmjs.org/susurration-agent-daemon/latest", {
+      signal: AbortSignal.timeout(5000)
+    });
+    if (!resp.ok)
+      return;
+    const data = await resp.json();
+    if (data.version && data.version !== PKG_VERSION) {
+      process.stderr.write(`[susu] update available: ${PKG_VERSION} → ${data.version}
+` + `[susu] run: npm update -g susurration-agent-daemon
+`);
+    }
+  } catch {}
+}
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  checkForUpdate();
   const cfg = await loadConfig(args);
   const susu = { api_url: cfg.api_url, token: cfg.token };
-  const provider = cfg.llm.provider === "openai" ? new OpenAIProvider(cfg.llm.api_key, cfg.llm.model) : new AnthropicProvider(cfg.llm.api_key, cfg.llm.model);
+  const provider = cfg.llm.provider === "openai" ? new OpenAIProvider(cfg.llm.api_key, cfg.llm.model, cfg.llm.base_url) : new AnthropicProvider(cfg.llm.api_key, cfg.llm.model);
   const log = new DecisionLog(cfg.decision_log_path);
   const limiter = new MinuteRateLimiter(cfg.agent.max_calls_per_minute);
+  const paperTrader = cfg.paper_trading?.enabled ? new PaperTrader(join(process.env.HOME ?? ".", ".susu", "paper_trades.json"), cfg.paper_trading.min_size_factor ?? 0.5, cfg.paper_trading.max_open, cfg.event_log_path) : null;
   let myAddress = null;
   let myHandle = null;
   try {
@@ -15271,27 +15624,48 @@ async function main() {
     }
   } catch {}
   const mode = args.once ? "poll-once" : "stream";
-  process.stderr.write(`[daemon] starting as ${myHandle ? `@${myHandle}` : `(${myAddress?.slice(0, 8) ?? "anon"})`}, ` + `mode=${mode}, ` + `provider=${cfg.llm.provider}/${cfg.llm.model}, ` + `dry_run_pushes=${cfg.dry_run_pushes}, ` + `cap=${cfg.agent.max_calls_per_minute}/min
+  process.stderr.write(`[daemon] starting as ${myHandle ? `@${myHandle}` : `(${myAddress?.slice(0, 8) ?? "anon"})`}, ` + `mode=${mode}, ` + `provider=${cfg.llm.provider}/${cfg.llm.model}, ` + `dry_run_pushes=${cfg.dry_run_pushes}` + `${paperTrader ? ", paper_trading=on" : ""}` + `, cap=${cfg.agent.max_calls_per_minute}/min
 `);
   if (args.once) {
-    return await runOncePoll(susu, provider, log, limiter, cfg, myAddress);
+    return await runOncePoll(susu, provider, log, limiter, cfg, myAddress, paperTrader);
   }
-  let stopped = false;
-  const onSigint = () => {
-    stopped = true;
-    process.stderr.write(`
-[daemon] stopping (SIGINT)
-`);
-    process.exit(0);
+  const pidPath = join(process.env.HOME ?? ".", ".susu", "agent-daemon.pid");
+  await mkdir(dirname2(pidPath), { recursive: true });
+  await writeFile(pidPath, String(process.pid), "utf8");
+  const cleanupPid = () => {
+    try {
+      unlinkSync(pidPath);
+    } catch {}
   };
-  process.on("SIGINT", onSigint);
+  process.on("exit", cleanupPid);
+  let stopped = false;
+  const abortCtl = new AbortController;
+  const gracefulStop = (sig) => {
+    if (stopped)
+      return;
+    stopped = true;
+    abortCtl.abort();
+    process.stderr.write(`
+[daemon] stopping (${sig})
+`);
+  };
+  process.on("SIGINT", () => {
+    gracefulStop("SIGINT");
+  });
+  process.on("SIGTERM", () => {
+    gracefulStop("SIGTERM");
+  });
+  if (paperTrader)
+    paperTrader.startTracking();
   let backoffMs = 1000;
   const MAX_BACKOFF = 30000;
   while (!stopped) {
     const startedAt = Date.now();
     try {
-      await runOneStream(susu, provider, log, limiter, cfg, myAddress);
+      await runOneStream(susu, provider, log, limiter, cfg, myAddress, paperTrader, abortCtl.signal);
     } catch (err) {
+      if (stopped)
+        break;
       process.stderr.write(`[daemon] stream error: ${err?.message ?? err}
 `);
     }
@@ -15305,9 +15679,33 @@ async function main() {
     await new Promise((r2) => setTimeout(r2, backoffMs));
     backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF);
   }
+  if (paperTrader)
+    paperTrader.stopTracking();
   return 0;
 }
-async function runOncePoll(susu, provider, log, limiter, cfg, myAddress) {
+function loadAlreadyProcessedIds(decisionLogPath) {
+  const ids = new Set;
+  if (!decisionLogPath)
+    return ids;
+  try {
+    const content = readFileSync2(decisionLogPath, "utf8");
+    for (const line of content.split(`
+`)) {
+      if (!line.trim())
+        continue;
+      try {
+        const entry = JSON.parse(line);
+        const trig = entry.triggering_event;
+        if (trig?.signal_id)
+          ids.add(trig.signal_id);
+        if (trig?.reaction_id)
+          ids.add(trig.reaction_id);
+      } catch {}
+    }
+  } catch {}
+  return ids;
+}
+async function runOncePoll(susu, provider, log, limiter, cfg, myAddress, paperTrader) {
   const state = await loadState(cfg.state_path);
   process.stderr.write(`[daemon] poll-once: last_seen=${state.last_seen_iso ?? "(none)"}
 `);
@@ -15321,17 +15719,33 @@ async function runOncePoll(susu, provider, log, limiter, cfg, myAddress) {
     return 1;
   }
   events.reverse();
-  const actionable = events.filter((e2) => (e2?.kind === "signal" || e2?.kind === "reaction") && (!myAddress || e2.from_address !== myAddress));
-  process.stderr.write(`[daemon] poll-once: ${events.length} new event(s), ${actionable.length} actionable
+  const processed = loadAlreadyProcessedIds(cfg.decision_log_path);
+  const actionable = events.filter((e2) => {
+    if (e2?.kind !== "signal" && e2?.kind !== "reaction")
+      return false;
+    if (myAddress && e2.from_address === myAddress)
+      return false;
+    const eventId = e2.signal_id ?? e2.reaction_id;
+    if (eventId && processed.has(eventId))
+      return false;
+    return true;
+  });
+  const skipped = events.filter((e2) => {
+    const eid = e2?.signal_id ?? e2?.reaction_id;
+    return eid && processed.has(eid);
+  }).length;
+  process.stderr.write(`[daemon] poll-once: ${events.length} new event(s), ${actionable.length} actionable` + `${skipped > 0 ? `, ${skipped} already-processed skipped` : ""}
 `);
   for (const evt of actionable) {
     try {
-      await handleEvent(evt, susu, provider, log, limiter, cfg);
+      await handleEvent(evt, susu, provider, log, limiter, cfg, paperTrader);
     } catch (err) {
       process.stderr.write(`[daemon] handle error on ${evt.signal_id ?? evt.reaction_id ?? "?"}: ${err?.message ?? err}
 `);
     }
   }
+  if (paperTrader)
+    await paperTrader.checkOnce();
   const newest = events.length > 0 ? events[events.length - 1].created_at : state.last_seen_iso;
   if (newest && newest !== state.last_seen_iso) {
     await saveState(cfg.state_path, { last_seen_iso: newest });
@@ -15340,9 +15754,12 @@ async function runOncePoll(susu, provider, log, limiter, cfg, myAddress) {
   }
   return 0;
 }
-async function runOneStream(susu, provider, log, limiter, cfg, myAddress) {
+async function runOneStream(susu, provider, log, limiter, cfg, myAddress, paperTrader, signal) {
   const url = susu.api_url.replace(/\/$/, "") + "/signals/feed/stream";
-  const resp = await fetch(url, { headers: { authorization: `Bearer ${susu.token}` } });
+  const resp = await fetch(url, {
+    headers: { authorization: `Bearer ${susu.token}` },
+    signal
+  });
   if (resp.status === 401 || resp.status === 403) {
     throw new Error(`auth failed (HTTP ${resp.status}); your token may have expired — re-run \`susu login\` and update config`);
   }
@@ -15379,22 +15796,34 @@ async function runOneStream(susu, provider, log, limiter, cfg, myAddress) {
       } catch {
         continue;
       }
+      if (cfg.event_log_path) {
+        appendFile2(cfg.event_log_path, JSON.stringify(evt) + `
+`, "utf8").catch(() => {});
+      }
       if (evt?.kind !== "signal" && evt?.kind !== "reaction")
         continue;
       if (myAddress && evt.from_address === myAddress)
         continue;
-      handleEvent(evt, susu, provider, log, limiter, cfg).catch((err) => {
+      handleEvent(evt, susu, provider, log, limiter, cfg, paperTrader).catch((err) => {
         process.stderr.write(`[daemon] handle error: ${err?.message ?? err}
 `);
       });
     }
   }
 }
-async function handleEvent(evt, susu, provider, log, limiter, cfg) {
+async function handleEvent(evt, susu, provider, log, limiter, cfg, paperTrader) {
   if (!limiter.tryConsume()) {
     process.stderr.write(`[daemon] rate-limited (>${cfg.agent.max_calls_per_minute}/min); skipping event
 `);
     return;
+  }
+  if (evt.payload && typeof evt.payload === "object") {
+    const { payload: normalized, warnings } = normalizeSignalPayload(evt.payload);
+    evt = { ...evt, payload: normalized };
+    for (const w2 of warnings) {
+      process.stderr.write(`[daemon] signal normalize warn: ${w2}
+`);
+    }
   }
   const channelId = evt.channel_id;
   const channelLabel = evt.channel_name ?? (evt.peer?.username ? `@${evt.peer.username}` : channelId.slice(0, 8));
@@ -15438,6 +15867,44 @@ async function handleEvent(evt, susu, provider, log, limiter, cfg) {
     error = err?.message ?? String(err);
   }
   await log.log({ ctx, decision, stats, result, error });
+  if (paperTrader && !error) {
+    paperTrader.onDecision(decision, evt);
+  }
+  if (cfg.on_decision) {
+    try {
+      const hookPayload = JSON.stringify({
+        decision,
+        trigger: evt,
+        result: result ?? null,
+        error: error ?? null,
+        stats: stats ?? null
+      });
+      const child = spawn("sh", ["-c", cfg.on_decision], {
+        stdio: ["pipe", "ignore", "pipe"]
+      });
+      child.stdin.write(hookPayload);
+      child.stdin.end();
+      const killTimer = setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {}
+      }, 30000);
+      child.on("exit", () => clearTimeout(killTimer));
+      let stderrBuf = "";
+      child.stderr.on("data", (chunk) => {
+        stderrBuf += chunk.toString();
+      });
+      child.on("exit", (code) => {
+        if (code !== 0 && stderrBuf) {
+          process.stderr.write(`[daemon] on_decision hook exit=${code}: ${stderrBuf.slice(0, 300)}
+`);
+        }
+      });
+    } catch (hookErr) {
+      process.stderr.write(`[daemon] on_decision hook error: ${hookErr?.message ?? hookErr}
+`);
+    }
+  }
 }
 main().then((code) => process.exit(code)).catch((err) => {
   process.stderr.write(`[daemon] fatal: ${err?.message ?? err}

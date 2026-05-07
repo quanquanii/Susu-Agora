@@ -31,13 +31,17 @@
 //   after the daemon started (BETA-1.c's feed-stream extender wires that
 //   up automatically).
 
-import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { dirname } from "node:path";
+import { readFile, writeFile, appendFile, mkdir, unlink } from "node:fs/promises";
+import { unlinkSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { spawn } from "node:child_process";
 import {
   AnthropicProvider, OpenAIProvider,
   type LLMProvider, type AgentContext, type AgentDecision,
 } from "./llm.ts";
 import { DecisionLog } from "./decision_log.ts";
+import { PaperTrader } from "./paper_trading.ts";
+import { normalizeSignalPayload } from "./normalize.ts";
 import {
   pushSignal, pushReaction, recentSignals, feedSince,
   type SusuClientConfig,
@@ -52,6 +56,8 @@ interface DaemonConfig {
     provider: "anthropic" | "openai";
     api_key: string;
     model: string;
+    /** Custom base URL for OpenAI-compatible APIs (DeepSeek, Gemini, Ollama, etc.) */
+    base_url?: string;
   };
   agent: {
     system_prompt: string;
@@ -70,6 +76,21 @@ interface DaemonConfig {
    *  Defaults to `~/.susu/agent-daemon.state.json`. Ignored in long-running
    *  SSE mode (the SSE stream is inherently stateful). */
   state_path?: string;
+  /** Built-in paper trading. When enabled, daemon opens paper positions
+   *  on react +1 decisions with size_factor >= min_size_factor. In-process,
+   *  zero spawn overhead. Writes to ~/.susu/paper_trades.json. */
+  paper_trading?: {
+    enabled: boolean;
+    min_size_factor?: number;  // default 0.5
+    max_open?: number;         // default unlimited (no cap)
+  };
+  /** Optional: shell command executed after every decision. For bridging
+   *  to external trading systems (broker API, DEX, webhook). JSON on stdin.
+   *  Most users should use paper_trading instead. */
+  on_decision?: string;
+  /** Path for local event log (all SSE events, not just decisions).
+   *  Used by `susu feed` to display history without a second SSE connection. */
+  event_log_path?: string;
 }
 
 function parseArgs(argv: string[]): { config?: string; once?: boolean } {
@@ -102,8 +123,8 @@ Modes:
                            every N minutes. Latency = your scheduler interval.
                            Works on a laptop that sleeps overnight.
 
-Cron example (every 10 min):
-  */10 * * * * /usr/local/bin/susu-agent-daemon --config /home/me/agent.config.json --once
+Cron example (every 2 min — recommended for paper trading):
+  */2 * * * * /usr/local/bin/susu-agent-daemon --config /home/me/agent.config.json --once
 
 
 Config file shape (.json):
@@ -121,8 +142,19 @@ Config file shape (.json):
       "history_per_channel": 20
     },
     "decision_log_path": "~/.susu/agent-decisions.jsonl",
-    "dry_run_pushes": true
+    "dry_run_pushes": true,
+    "paper_trading": { "enabled": true }
   }
+
+paper_trading (default: enabled):
+  Built-in paper trading. On react +1 with size_factor >= 0.5, opens a
+  paper position in ~/.susu/paper_trades.json. In-process, zero overhead.
+  Customize min_size_factor (default 0.5) and max_open (default unlimited).
+
+on_decision (optional, for power users):
+  Shell command fired after every decision. JSON context on stdin.
+  Use to bridge to your own trading system (broker API, DEX, webhook).
+  Most users don't need this — paper_trading handles the default case.
 
 Behavior:
   - Subscribes to your /signals/feed/stream over SSE.
@@ -145,6 +177,7 @@ async function loadConfig(args: ReturnType<typeof parseArgs>): Promise<DaemonCon
   parsed.agent.max_calls_per_minute = parsed.agent.max_calls_per_minute ?? 10;
   parsed.agent.history_per_channel = parsed.agent.history_per_channel ?? 20;
   parsed.state_path = parsed.state_path ?? `${process.env.HOME ?? "."}/.susu/agent-daemon.state.json`;
+  parsed.event_log_path = parsed.event_log_path ?? `${process.env.HOME ?? "."}/.susu/events.jsonl`;
   return parsed;
 }
 
@@ -189,17 +222,46 @@ class MinuteRateLimiter {
 
 // ── Main loop ────────────────────────────────────────────────────────────
 
+const PKG_VERSION = "0.0.6";
+
+async function checkForUpdate(): Promise<void> {
+  try {
+    const resp = await fetch("https://registry.npmjs.org/susurration-agent-daemon/latest", {
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (!resp.ok) return;
+    const data = await resp.json() as { version?: string };
+    if (data.version && data.version !== PKG_VERSION) {
+      process.stderr.write(
+        `[susu] update available: ${PKG_VERSION} → ${data.version}\n` +
+        `[susu] run: npm update -g susurration-agent-daemon\n`,
+      );
+    }
+  } catch { /* best effort */ }
+}
+
 async function main(): Promise<number> {
   const args = parseArgs(process.argv.slice(2));
+  checkForUpdate();
   const cfg = await loadConfig(args);
   const susu: SusuClientConfig = { api_url: cfg.api_url, token: cfg.token };
 
   const provider: LLMProvider = cfg.llm.provider === "openai"
-    ? new OpenAIProvider(cfg.llm.api_key, cfg.llm.model)
+    ? new OpenAIProvider(cfg.llm.api_key, cfg.llm.model, cfg.llm.base_url)
     : new AnthropicProvider(cfg.llm.api_key, cfg.llm.model);
 
   const log = new DecisionLog(cfg.decision_log_path);
   const limiter = new MinuteRateLimiter(cfg.agent.max_calls_per_minute!);
+
+  // Built-in paper trading (replaces the old on_decision hook spawn pattern).
+  const paperTrader = cfg.paper_trading?.enabled
+    ? new PaperTrader(
+        join(process.env.HOME ?? ".", ".susu", "paper_trades.json"),
+        cfg.paper_trading.min_size_factor ?? 0.5,
+        cfg.paper_trading.max_open,
+        cfg.event_log_path,
+      )
+    : null;
 
   // Discover own address + handle so we can skip self-events.
   let myAddress: string | null = null;
@@ -220,19 +282,35 @@ async function main(): Promise<number> {
     `[daemon] starting as ${myHandle ? `@${myHandle}` : `(${myAddress?.slice(0, 8) ?? "anon"})`}, ` +
     `mode=${mode}, ` +
     `provider=${cfg.llm.provider}/${cfg.llm.model}, ` +
-    `dry_run_pushes=${cfg.dry_run_pushes}, ` +
-    `cap=${cfg.agent.max_calls_per_minute}/min\n`,
+    `dry_run_pushes=${cfg.dry_run_pushes}` +
+    `${paperTrader ? ", paper_trading=on" : ""}` +
+    `, cap=${cfg.agent.max_calls_per_minute}/min\n`,
   );
 
   if (args.once) {
-    return await runOncePoll(susu, provider, log, limiter, cfg, myAddress);
+    return await runOncePoll(susu, provider, log, limiter, cfg, myAddress, paperTrader);
   }
 
-  // Long-running SSE stream mode (default).
-  // Ctrl-C → graceful exit.
+  // ── PID file + graceful shutdown ──────────────────────────────────────
+  const pidPath = join(process.env.HOME ?? ".", ".susu", "agent-daemon.pid");
+  await mkdir(dirname(pidPath), { recursive: true });
+  await writeFile(pidPath, String(process.pid), "utf8");
+  const cleanupPid = () => { try { unlinkSync(pidPath); } catch {} };
+  process.on("exit", cleanupPid);
+
   let stopped = false;
-  const onSigint = () => { stopped = true; process.stderr.write("\n[daemon] stopping (SIGINT)\n"); process.exit(0); };
-  process.on("SIGINT", onSigint);
+  const abortCtl = new AbortController();
+  const gracefulStop = (sig: string) => {
+    if (stopped) return;
+    stopped = true;
+    abortCtl.abort();
+    process.stderr.write(`\n[daemon] stopping (${sig})\n`);
+  };
+  process.on("SIGINT", () => { gracefulStop("SIGINT"); });
+  process.on("SIGTERM", () => { gracefulStop("SIGTERM"); });
+
+  // Start paper trading position tracker (60s interval).
+  if (paperTrader) paperTrader.startTracking();
 
   // Reconnect loop: same exponential backoff pattern as cli watch.
   let backoffMs = 1000;
@@ -240,8 +318,9 @@ async function main(): Promise<number> {
   while (!stopped) {
     const startedAt = Date.now();
     try {
-      await runOneStream(susu, provider, log, limiter, cfg, myAddress);
+      await runOneStream(susu, provider, log, limiter, cfg, myAddress, paperTrader, abortCtl.signal);
     } catch (err) {
+      if (stopped) break;
       process.stderr.write(`[daemon] stream error: ${(err as Error)?.message ?? err}\n`);
     }
     if (stopped) break;
@@ -251,7 +330,34 @@ async function main(): Promise<number> {
     await new Promise((r) => setTimeout(r, backoffMs));
     backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF);
   }
+
+  // Cleanup.
+  if (paperTrader) paperTrader.stopTracking();
   return 0;
+}
+
+// ── Dedup (--once mode) ──────────────────────────────────────────────────
+//
+// Reads the decision log JSONL and collects all event IDs that were already
+// evaluated (react, noop, push — any decision counts). This prevents --once
+// cron ticks from re-evaluating signals that feedSince returns again.
+
+function loadAlreadyProcessedIds(decisionLogPath?: string): Set<string> {
+  const ids = new Set<string>();
+  if (!decisionLogPath) return ids;
+  try {
+    const content = readFileSync(decisionLogPath, "utf8");
+    for (const line of content.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const entry = JSON.parse(line);
+        const trig = entry.triggering_event;
+        if (trig?.signal_id) ids.add(trig.signal_id);
+        if (trig?.reaction_id) ids.add(trig.reaction_id);
+      } catch { /* skip malformed lines */ }
+    }
+  } catch { /* file doesn't exist yet — first run */ }
+  return ids;
 }
 
 // ── --once poll mode ─────────────────────────────────────────────────────
@@ -268,6 +374,7 @@ async function runOncePoll(
   limiter: MinuteRateLimiter,
   cfg: DaemonConfig,
   myAddress: string | null,
+  paperTrader: PaperTrader | null,
 ): Promise<number> {
   const state = await loadState(cfg.state_path!);
   process.stderr.write(`[daemon] poll-once: last_seen=${state.last_seen_iso ?? "(none)"}\n`);
@@ -281,32 +388,43 @@ async function runOncePoll(
     return 1;
   }
 
-  // Server returns DESC; reverse to chrono so we process oldest first
-  // (matches what the SSE handler would have seen if the daemon had been
-  // running continuously).
   events.reverse();
 
-  // Filter actionable events: signals + reactions, skip self.
-  const actionable = events.filter((e) =>
-    (e?.kind === "signal" || e?.kind === "reaction") &&
-    (!myAddress || e.from_address !== myAddress)
-  );
+  // Dedup: skip events already evaluated in previous --once runs.
+  const processed = loadAlreadyProcessedIds(cfg.decision_log_path);
 
-  process.stderr.write(`[daemon] poll-once: ${events.length} new event(s), ${actionable.length} actionable\n`);
+  const actionable = events.filter((e) => {
+    if (e?.kind !== "signal" && e?.kind !== "reaction") return false;
+    if (myAddress && e.from_address === myAddress) return false;
+    const eventId = e.signal_id ?? e.reaction_id;
+    if (eventId && processed.has(eventId)) return false;
+    return true;
+  });
+
+  const skipped = events.filter((e) => {
+    const eid = e?.signal_id ?? e?.reaction_id;
+    return eid && processed.has(eid);
+  }).length;
+
+  process.stderr.write(
+    `[daemon] poll-once: ${events.length} new event(s), ${actionable.length} actionable` +
+    `${skipped > 0 ? `, ${skipped} already-processed skipped` : ""}\n`,
+  );
 
   for (const evt of actionable) {
     try {
-      await handleEvent(evt, susu, provider, log, limiter, cfg);
+      await handleEvent(evt, susu, provider, log, limiter, cfg, paperTrader);
     } catch (err) {
       process.stderr.write(`[daemon] handle error on ${evt.signal_id ?? evt.reaction_id ?? "?"}: ${(err as Error)?.message ?? err}\n`);
-      // Continue processing the rest of the batch — one bad event shouldn't
-      // halt the whole poll cycle.
     }
   }
 
-  // Advance last_seen to the newest event's created_at, NOT to "now". This
-  // way if we crash mid-batch, the next cron tick re-processes from where
-  // we got stuck (worst case: a few duplicate noop decisions).
+  // Check open paper positions against current prices (SL/TP/trailing/time).
+  // In stream mode this runs on a 60s interval; in --once mode we check once
+  // after processing all events so positions opened by earlier cron ticks
+  // (or this tick) get evaluated.
+  if (paperTrader) await paperTrader.checkOnce();
+
   const newest = events.length > 0 ? events[events.length - 1].created_at : state.last_seen_iso;
   if (newest && newest !== state.last_seen_iso) {
     await saveState(cfg.state_path!, { last_seen_iso: newest });
@@ -323,9 +441,14 @@ async function runOneStream(
   limiter: MinuteRateLimiter,
   cfg: DaemonConfig,
   myAddress: string | null,
+  paperTrader: PaperTrader | null,
+  signal?: AbortSignal,
 ): Promise<void> {
   const url = susu.api_url.replace(/\/$/, "") + "/signals/feed/stream";
-  const resp = await fetch(url, { headers: { authorization: `Bearer ${susu.token}` } });
+  const resp = await fetch(url, {
+    headers: { authorization: `Bearer ${susu.token}` },
+    signal,
+  });
   if (resp.status === 401 || resp.status === 403) {
     throw new Error(`auth failed (HTTP ${resp.status}); your token may have expired — re-run \`susu login\` and update config`);
   }
@@ -354,14 +477,17 @@ async function runOneStream(
       if (!data) continue;
       let evt: any;
       try { evt = JSON.parse(data); } catch { continue; }
-      // Daemon only acts on incoming signal / reaction events. friend_* /
-      // channel_member_* etc are observability for the human, not actionable
-      // by the agent.
+
+      // Write ALL events to local event log (for `susu feed` to read
+      // without opening a second SSE connection).
+      if (cfg.event_log_path) {
+        appendFile(cfg.event_log_path, JSON.stringify(evt) + "\n", "utf8").catch(() => {});
+      }
+
+      // Daemon only acts on signal / reaction events.
       if (evt?.kind !== "signal" && evt?.kind !== "reaction") continue;
-      // Skip own events (we don't react to ourselves).
       if (myAddress && evt.from_address === myAddress) continue;
-      // Best-effort handle the event; never let one bad event kill the loop.
-      handleEvent(evt, susu, provider, log, limiter, cfg).catch((err) => {
+      handleEvent(evt, susu, provider, log, limiter, cfg, paperTrader).catch((err) => {
         process.stderr.write(`[daemon] handle error: ${(err as Error)?.message ?? err}\n`);
       });
     }
@@ -375,11 +501,21 @@ async function handleEvent(
   log: DecisionLog,
   limiter: MinuteRateLimiter,
   cfg: DaemonConfig,
+  paperTrader: PaperTrader | null,
 ): Promise<void> {
   if (!limiter.tryConsume()) {
     process.stderr.write(`[daemon] rate-limited (>${cfg.agent.max_calls_per_minute}/min); skipping event\n`);
     return;
   }
+  // Normalize signal payload before LLM and paper trading see it.
+  if (evt.payload && typeof evt.payload === "object") {
+    const { payload: normalized, warnings } = normalizeSignalPayload(evt.payload as Record<string, unknown>);
+    evt = { ...evt, payload: normalized };
+    for (const w of warnings) {
+      process.stderr.write(`[daemon] signal normalize warn: ${w}\n`);
+    }
+  }
+
   const channelId = evt.channel_id;
   const channelLabel = evt.channel_name ?? (evt.peer?.username ? `@${evt.peer.username}` : channelId.slice(0, 8));
 
@@ -429,6 +565,41 @@ async function handleEvent(
   }
 
   await log.log({ ctx, decision, stats, result, error });
+
+  // Built-in paper trading (in-process, zero overhead).
+  if (paperTrader && !error) {
+    paperTrader.onDecision(decision, evt);
+  }
+
+  // Optional on_decision hook for power users bridging external systems.
+  // Fire-and-forget: daemon does not wait. Timeout kills after 30s.
+  if (cfg.on_decision) {
+    try {
+      const hookPayload = JSON.stringify({
+        decision, trigger: evt,
+        result: result ?? null, error: error ?? null, stats: stats ?? null,
+      });
+      const child = spawn("sh", ["-c", cfg.on_decision], {
+        stdio: ["pipe", "ignore", "pipe"],
+      });
+      child.stdin!.write(hookPayload);
+      child.stdin!.end();
+      // Kill after 30s to prevent zombie processes.
+      const killTimer = setTimeout(() => {
+        try { child.kill("SIGKILL"); } catch {}
+      }, 30_000);
+      child.on("exit", () => clearTimeout(killTimer));
+      let stderrBuf = "";
+      child.stderr!.on("data", (chunk: Buffer) => { stderrBuf += chunk.toString(); });
+      child.on("exit", (code) => {
+        if (code !== 0 && stderrBuf) {
+          process.stderr.write(`[daemon] on_decision hook exit=${code}: ${stderrBuf.slice(0, 300)}\n`);
+        }
+      });
+    } catch (hookErr) {
+      process.stderr.write(`[daemon] on_decision hook error: ${(hookErr as Error)?.message ?? hookErr}\n`);
+    }
+  }
 }
 
 main().then((code) => process.exit(code)).catch((err) => {

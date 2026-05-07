@@ -78,14 +78,14 @@ const TOOL_REACT = {
             type: "number",
             minimum: 0.1,
             maximum: 1.0,
-            description: "Optional. How much of the peer's size you'd take (1.0 = full, 0.5 = half). Use lower values when partially agreeing or when value=-1 to signal the small residual conviction.",
+            description: "REQUIRED. Your conviction level: 1.0 = full size, 0.5 = half, 0.3 = minimum. Always provide — paper trading uses this to size positions.",
           },
           note: {
             type: "string",
-            description: "Optional. ≤15 words explaining the stance to the peer (separate from `reason` which is your private decision log).",
+            description: "≤15 words explaining the stance to the peer (separate from `reason` which is your private decision log).",
           },
         },
-        required: ["value"],
+        required: ["value", "size_factor"],
         additionalProperties: true,
       },
       reason: { type: "string", description: "Brief reasoning visible only in YOUR decision log (peer doesn't see this)." },
@@ -174,8 +174,8 @@ export class AnthropicProvider implements LLMProvider {
 
 export class OpenAIProvider implements LLMProvider {
   private client: OpenAI;
-  constructor(apiKey: string, private model: string) {
-    this.client = new OpenAI({ apiKey });
+  constructor(apiKey: string, private model: string, baseURL?: string) {
+    this.client = new OpenAI({ apiKey, ...(baseURL ? { baseURL } : {}) });
   }
 
   async decide(ctx: AgentContext, systemPrompt: string) {

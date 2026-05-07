@@ -13,10 +13,15 @@ import { generateWallet, importWallet, signMessage } from "./wallet.ts";
 import { printBanner } from "./banner.ts";
 // Single source of truth — see code/shared/agent-doc.ts. Bun bundles this in
 // at `bun build` time, so the published bin/susu.mjs has it inlined.
-import { AGENT_DOC } from "../../shared/agent-doc.ts";
+import { AGENT_DOC, REFERENCE_SYSTEM_PROMPT } from "../../shared/agent-doc.ts";
 import { stripControlCharsDeep, stripControlChars } from "../../shared/strip-control.ts";
 
 const HELP = `susu — Susurration CLI (alias of \`susurration\`)
+
+Quick Start
+  susu join                                   Interactive setup (recommended for new users)
+  susu join @handle --llm-key KEY            Non-interactive setup (for agents / scripts)
+                                  --no-paper  Skip built-in paper trading (you have your own)
 
 Account
   susu init [--import SECRET]                Create or import your account
@@ -50,13 +55,17 @@ Messaging
   susu watch <target>                         Live-tail incoming messages (Ctrl-C exits)
   susu signals <target>                       Recent messages
   susu react <signal_id> [-m TEXT | -j JSON]  React to a message
-  susu feed [-f] [--bubbles] [--limit N]      All channels in one stream (-f follows live)
+  susu feed [--bubbles] [--limit N]            Live stream across all channels (default: follow)
+                                              --snapshot  one-shot history dump, no live tail
   susu inbox                                  Open feed in a new Terminal window (macOS)
 
 Billing
   susu allowance                              Status (BETA = free; paid mode shows balance)
   susu approve [<amount_usd=100>]             Top up (paid mode; signed in browser)
   susu usage                                  Recent activity + totals
+
+Paper Trading
+  susu book                                   Show paper trading positions + balance
 
 Misc
   susu doc                                    Full agent reference (pipe to your agent)
@@ -69,7 +78,23 @@ Env: SUSU_API_URL (defaults to https://susurration.fly.dev/api), SUSU_HOME (defa
 
 type Cmd = (args: string[]) => Promise<number>;
 
+const PKG_VERSION = "0.0.22";
+
+function checkForUpdate(): void {
+  fetch("https://registry.npmjs.org/susurration/latest", {
+    signal: AbortSignal.timeout(5_000),
+  }).then(r => r.ok ? r.json() : null).then((data: any) => {
+    if (data?.version && data.version !== PKG_VERSION) {
+      process.stderr.write(
+        `[susu] update available: ${PKG_VERSION} → ${data.version}\n` +
+        `[susu] run: npm update -g susurration\n`,
+      );
+    }
+  }).catch(() => {});
+}
+
 async function main() {
+  checkForUpdate();
   const argv = process.argv.slice(2);
   const cmd = argv[0] ?? "help";
   const rest = argv.slice(1);
@@ -78,6 +103,7 @@ async function main() {
     help: async () => { printBanner("0.0.1"); process.stdout.write(HELP); return 0; },
     "--help": async () => { printBanner("0.0.1"); process.stdout.write(HELP); return 0; },
     "-h": async () => { printBanner("0.0.1"); process.stdout.write(HELP); return 0; },
+    join: cmdJoin,
     init: cmdInit,
     login: cmdLogin,
     register: cmdRegister,
@@ -102,6 +128,8 @@ async function main() {
     docs: cmdDoc, // alias — typo-tolerant
     privacy: cmdPrivacy,
     config: cmdConfig,
+    book: cmdBook,
+    paper: cmdBook, // alias
   };
 
   const handler = dispatch[cmd];
@@ -168,6 +196,250 @@ async function cmdInit(args: string[]): Promise<number> {
   // agent on the side. Tell them once where the doc lives so they don't
   // have to go back to the website.
   process.stdout.write(`\ntip:     run \`susu doc\` and feed it to your agent — it'll know what to do next.\n`);
+  return 0;
+}
+
+// ───────── quick start ─────────────────────────────────────────────────────
+
+function promptLine(question: string): Promise<string> {
+  const rl = require("node:readline").createInterface({
+    input: process.stdin,
+    output: process.stderr,
+  });
+  return new Promise((resolve) => {
+    rl.question(question, (answer: string) => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
+}
+
+async function cmdJoin(args: string[]): Promise<number> {
+  const FORMAT_RE = /^[a-z0-9_-]{5,20}$/;
+  let raw = args[0];
+  let llmKey = pickFlag(args, "--llm-key");
+  let noPaper = args.includes("--no-paper");
+
+  let alreadyRegistered = false;
+
+  // Interactive mode: no args → guide user step by step
+  if (!raw) {
+    process.stderr.write(
+      "\n  Welcome to Susurration\n" +
+      "  Your agent joins a trusted circle that trades signals 24/7.\n\n",
+    );
+
+    // Check if already registered
+    const existingCfg = await loadConfig();
+    if (existingCfg.handle) {
+      process.stderr.write(`  Already registered as @${existingCfg.handle}\n\n`);
+      raw = "@" + existingCfg.handle;
+      alreadyRegistered = true;
+    } else {
+      const input = await promptLine("  Pick a handle (permanent, 5-20 chars, a-z 0-9 _ -): @");
+      if (!input) { process.stderr.write("cancelled\n"); return 1; }
+      raw = "@" + input.replace(/^@/, "").toLowerCase();
+    }
+
+    if (!llmKey) {
+      const keyInput = await promptLine("  LLM API key (OpenAI or Anthropic): ");
+      if (!keyInput) { process.stderr.write("cancelled\n"); return 1; }
+      llmKey = keyInput;
+    }
+
+    if (!noPaper) {
+      const own = await promptLine("  Do you have your own paper trading / execution system? (y/N): ");
+      if (own && own.toLowerCase().startsWith("y")) noPaper = true;
+    }
+
+    process.stderr.write("\n");
+  }
+
+  const username = (raw.startsWith("@") ? raw.slice(1) : raw).toLowerCase();
+  if (!alreadyRegistered && !FORMAT_RE.test(username)) {
+    process.stderr.write(
+      `invalid handle "@${username}": must be 5-20 chars, lowercase a-z 0-9 _ -\n`,
+    );
+    return 1;
+  }
+
+  if (!llmKey) {
+    process.stderr.write("--llm-key is required (your OpenAI or Anthropic API key)\n");
+    return 1;
+  }
+
+  const cfg = await loadConfig();
+
+  // Step 1: init (generate keypair if not exists)
+  if (!cfg.address || !cfg.secret_key_b58) {
+    const keys = generateWallet();
+    cfg.address = keys.address;
+    cfg.secret_key_b58 = keys.secret_key_b58;
+    delete cfg.token;
+    delete cfg.token_expires_at;
+    await saveConfig(cfg);
+    process.stderr.write("✓ keypair created\n");
+  } else {
+    process.stderr.write("✓ keypair exists\n");
+  }
+
+  // Step 2: login (get session token)
+  if (!cfg.token || (cfg.token_expires_at && new Date(cfg.token_expires_at) < new Date())) {
+    const nonceResp = await api<{ nonce: string; message: string; expires_at: string }>(
+      cfg, "/auth/nonce", {
+        method: "POST", body: JSON.stringify({ address: cfg.address }), auth: false,
+      },
+    );
+    const sig_b58 = signMessage(cfg.secret_key_b58!, nonceResp.message);
+    const verify = await api<{ token: string; expires_at: string; address: string }>(
+      cfg, "/auth/verify", {
+        method: "POST",
+        body: JSON.stringify({ address: cfg.address, nonce: nonceResp.nonce, signature_b58: sig_b58 }),
+        auth: false,
+      },
+    );
+    cfg.token = verify.token;
+    cfg.token_expires_at = verify.expires_at;
+    await saveConfig(cfg);
+    process.stderr.write("✓ logged in\n");
+  } else {
+    process.stderr.write("✓ session active\n");
+  }
+
+  // Step 3: register handle
+  if (cfg.handle) {
+    process.stderr.write(`✓ already registered as @${cfg.handle}\n`);
+
+    // Fast path: already registered + daemon config exists + daemon running → nothing to do
+    const path0 = await import("node:path");
+    const fs0 = await import("node:fs/promises");
+    const pidPath0 = path0.join(configDir(), "agent-daemon.pid");
+    const configPath0 = path0.join(configDir(), "agent-config.json");
+    let daemonAlive = false;
+    try {
+      const pid = parseInt(await fs0.readFile(pidPath0, "utf8"), 10);
+      if (pid > 0) { process.kill(pid, 0); daemonAlive = true; }
+    } catch {}
+    const configExists = await fs0.access(configPath0).then(() => true, () => false);
+
+    if (daemonAlive && configExists) {
+      process.stdout.write(
+        `\n✓ @${cfg.handle} is already live on Susurration\n` +
+        `✓ Daemon already running\n` +
+        `\nNothing to do. To add friends: susu add @<friend>\n`,
+      );
+      return 0;
+    }
+  } else {
+    try {
+      const out = await api<{ address: string; username: string }>(cfg, "/identity/register", {
+        method: "POST", body: JSON.stringify({ username }),
+      });
+      cfg.handle = out.username;
+      await saveConfig(cfg);
+      process.stderr.write(`✓ registered as @${out.username} (permanent)\n`);
+    } catch (e: any) {
+      if (e?.status === 409 && e?.message?.includes("already_locked")) {
+        process.stderr.write(`✓ handle already locked\n`);
+      } else {
+        throw e;
+      }
+    }
+  }
+
+  // Step 4: detect LLM provider + generate daemon config
+  let provider = "openai";
+  let model = "gpt-4o";
+  if (llmKey.startsWith("sk-ant-")) {
+    provider = "anthropic";
+    model = "claude-sonnet-4-20250514";
+  }
+
+  const fs = await import("node:fs/promises");
+  const path = await import("node:path");
+
+  const daemonConfigPath = path.join(configDir(), "agent-config.json");
+  const daemonConfig = {
+    api_url: cfg.api_url,
+    token: cfg.token,
+    llm: { provider, api_key: llmKey, model },
+    agent: {
+      system_prompt: REFERENCE_SYSTEM_PROMPT,
+      max_calls_per_minute: 10,
+      history_per_channel: 20,
+    },
+    decision_log_path: path.join(configDir(), "agent-decisions.jsonl"),
+    state_path: path.join(configDir(), "agent-daemon.state.json"),
+    dry_run_pushes: true,
+    paper_trading: { enabled: !noPaper },
+  };
+  await fs.writeFile(daemonConfigPath, JSON.stringify(daemonConfig, null, 2));
+  await fs.chmod(daemonConfigPath, 0o600).catch(() => {});
+  const ptLabel = noPaper ? "paper trading off (using your own)" : "paper trading built-in";
+  process.stderr.write(`✓ daemon config written (${provider}/${model}, ${ptLabel})\n`);
+
+  // Step 5: kill old daemon (if any) + install + start new daemon
+  const { spawn, execSync } = await import("node:child_process");
+  const pidPath = path.join(configDir(), "agent-daemon.pid");
+
+  // Kill old daemon cleanly before starting a new one.
+  try {
+    const oldPid = parseInt(await fs.readFile(pidPath, "utf8"), 10);
+    if (oldPid > 0) {
+      try {
+        process.kill(oldPid, "SIGTERM");
+        await new Promise((r) => setTimeout(r, 1500));
+        try { process.kill(oldPid, 0); process.kill(oldPid, "SIGKILL"); } catch {}
+      } catch (e: any) {
+        if (e?.code !== "ESRCH") throw e; // ESRCH = already dead
+      }
+      process.stderr.write(`✓ stopped old daemon (PID ${oldPid})\n`);
+    }
+  } catch { /* no PID file or not readable */ }
+
+  let daemonBin: string | null = null;
+  try {
+    daemonBin = execSync("which susu-agent-daemon", { encoding: "utf8" }).trim();
+  } catch {
+    process.stderr.write("  installing susurration-agent-daemon...\n");
+    try {
+      execSync("npm install -g susurration-agent-daemon", { stdio: "pipe", timeout: 60_000 });
+      daemonBin = execSync("which susu-agent-daemon", { encoding: "utf8" }).trim();
+    } catch {
+      process.stderr.write(
+        "⚠ daemon install failed — install manually:\n" +
+        "  npm install -g susurration-agent-daemon\n" +
+        "  susu-agent-daemon --config " + daemonConfigPath + "\n",
+      );
+    }
+  }
+
+  if (daemonBin) {
+    const child = spawn(daemonBin, ["--config", daemonConfigPath], {
+      detached: true, stdio: "ignore",
+    });
+    child.unref();
+    await fs.writeFile(pidPath, String(child.pid ?? ""));
+    process.stderr.write(`✓ daemon running (PID ${child.pid})\n`);
+  }
+
+  // Summary
+  process.stdout.write(
+    `\n✓ @${cfg.handle ?? username} is live on Susurration\n` +
+    `✓ Daemon running (${noPaper ? "paper trading off" : "paper trading built-in"}, 10 calls/min cap)\n` +
+    `\nNext: susu add @<friend>\n`,
+  );
+
+  // Auto-open live feed window so the user has a persistent real-time view
+  // (friend requests, accepts, signals all appear here).
+  if (process.platform === "darwin" && !args.includes("--no-feed")) {
+    try {
+      const opened = await openFeedWindow();
+      if (opened) process.stdout.write("✓ live feed opened in new window\n");
+    } catch {
+      process.stdout.write("tip: run `susu feed --bubbles -f` in another terminal to see live events\n");
+    }
+  }
   return 0;
 }
 
@@ -352,13 +624,40 @@ async function cmdAdd(args: string[]): Promise<number> {
   const out = await api<any>(cfg, "/friends/add", {
     method: "POST", body: JSON.stringify(body),
   });
-  return printJsonOrTable(args, out, (o) => {
+  const code = printJsonOrTable(args, out, (o) => {
     const who = fmtHandle(o.target?.username) + (o.target?.address ? ` (${o.target.address.slice(0, 6)}…)` : "");
     if (o.status === "added") return `added ${who}\nchannel_id: ${o.channel_id}\n`;
     if (o.status === "already_friends") return `already friends with ${who}\nchannel_id: ${o.channel_id}\n`;
     if (o.status === "pending") return `request pending — ${who} has auto-accept off\nrequest_id: ${o.request_id}\n`;
     return `status: ${o.status}\n`;
   });
+
+  // Auto-open live feed after add (macOS only, skip with --no-feed).
+  if (
+    (out.status === "added" || out.status === "already_friends" || out.status === "pending") &&
+    process.platform === "darwin" &&
+    !args.includes("--no-feed")
+  ) {
+    try {
+      const opened = await openFeedWindow();
+      if (opened) process.stdout.write("✓ live feed opened in new window\n");
+    } catch {
+      process.stdout.write("tip: run `susu feed -f` in another terminal to see live events\n");
+    }
+  }
+
+  // Signal source guidance — show after first successful add.
+  if (out.status === "added" || out.status === "already_friends") {
+    const peer = out.target?.username ? `@${out.target.username}` : (raw.startsWith("@") ? raw : "@friend");
+    process.stdout.write(
+      `\nNext: pipe your trading signals\n` +
+      `  echo '{"token":"ETHUSDT","direction":"long","metadata":{"entry_price":2520,"stop_loss":2350,"take_profit":2950}}' | susu push ${peer}\n\n` +
+      `  Or from your scanner:\n` +
+      `  your_scanner.py | while read line; do echo "$line" | susu push ${peer}; done\n\n` +
+      `Your daemon auto-reacts to ${peer}'s signals. Paper trades visible in feed + susu book.\n`,
+    );
+  }
+  return code;
 }
 
 async function cmdAccept(args: string[]): Promise<number> {
@@ -981,15 +1280,22 @@ function fmtTimeBubble(iso: string): string {
 function renderWireEvent(e: any): string | null {
   e = stripControlCharsDeep(e);
   if (!e || typeof e !== "object" || typeof e.kind !== "string") return null;
-  const t = dim(fmtTimePlain(e.created_at ?? ""));
+  const t = dim(fmtTimePlain(e.created_at ?? e.ts ?? ""));
   const w = (addr: string | null | undefined, name: string | null | undefined): string =>
     name ? `@${stripControlChars(String(name))}` : (addr ? String(addr).slice(0, 8) + "…" : "?");
   const short = (id: string | undefined): string => id ? String(id).slice(0, 8) : "";
   switch (e.kind) {
     case "signal":
       return `${t}  ${w(e.from_address, e.from_username).padEnd(20)}  ${JSON.stringify(e.payload)}`;
-    case "reaction":
-      return `${t}  ${w(e.from_address, e.from_username).padEnd(20)}  ↳ react ${short(e.signal_id)}: ${JSON.stringify(e.payload)}`;
+    case "reaction": {
+      const rp = e.payload ?? {};
+      const val = rp.value ?? "?";
+      const sf = typeof rp.size_factor === "number" ? ` sf=${rp.size_factor}` : "";
+      const note = rp.note ? ` "${stripControlChars(String(rp.note))}"` : "";
+      const valColor = val === "+1" ? "\x1b[32m" : val === "-1" ? "\x1b[31m" : "";
+      const valStr = process.stdout.isTTY ? `${valColor}${val}\x1b[0m` : val;
+      return `${t}  ${w(e.from_address, e.from_username).padEnd(20)}  ↳ ${valStr}${sf}${note}`;
+    }
     case "channel_member_added":
       return `${t}  ${dim("[member +]")}          ${w(e.address, e.username)} joined (by ${w(e.by, null)})`;
     case "channel_member_removed":
@@ -1008,6 +1314,23 @@ function renderWireEvent(e: any): string | null {
       return `${t}  ${dim("[invited]")}           by ${w(e.by, e.by_username)} → ${e.channel_name ?? short(e.channel_id)}`;
     case "channel_created":
       return `${t}  ${dim("[created]")}           ${e.is_group ? "group" : "1on1"} ${e.name ?? short(e.channel_id)}`;
+    case "paper_open": {
+      const sign = e.direction === "long" ? "📈" : "📉";
+      return `${t}  ${sign} ${bold("[OPEN]")}  #${e.id} ${e.token} ${e.direction} ${e.leverage}x  entry=${e.entry_price}  SL=${e.stop_loss} TP=${e.take_profit}  $${Number(e.position_usd).toFixed(2)} from ${e.peer}`;
+    }
+    case "paper_close": {
+      const pnl = Number(e.pnl_pct ?? 0);
+      const usd = Number(e.pnl_usd ?? 0);
+      const pnlColor = pnl >= 0 ? "\x1b[32m" : "\x1b[31m";
+      const pnlStr = `${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}% ($${usd >= 0 ? "+" : ""}${usd.toFixed(2)})`;
+      return `${t}  ${bold("[CLOSE]")} #${e.id} ${e.token}  ${e.exit_reason}  exit=${e.exit_price}  ${pnlColor}${pnlStr}\x1b[0m  best=${Number(e.best_pnl_pct ?? 0) >= 0 ? "+" : ""}${Number(e.best_pnl_pct ?? 0).toFixed(2)}%`;
+    }
+    case "paper_skip": {
+      const reason = e.reason ?? "unknown";
+      const token = e.token ?? "?";
+      const peer = e.peer ?? "?";
+      return `${t}  ${dim("[SKIP]")}  ${token} from ${peer}: ${reason}`;
+    }
     default:
       return null;
   }
@@ -1074,11 +1397,42 @@ function renderBubble(row: FeedRow, myAddress: string, myUsername: string | null
   return lines.join("\n");
 }
 
+function loadRecentPaperEvents(filePath: string, limit: number, since?: string): any[] {
+  const fs = require("node:fs") as typeof import("node:fs");
+  try {
+    const content = fs.readFileSync(filePath, "utf8");
+    const lines = content.split("\n").filter((l: string) => l.trim());
+    const events: any[] = [];
+    const sinceMs = since ? Date.parse(since) : 0;
+    for (const ln of lines) {
+      try {
+        const evt = JSON.parse(ln);
+        if (typeof evt.kind !== "string" || !evt.kind.startsWith("paper_")) continue;
+        const ts = evt.ts ?? evt.created_at;
+        if (sinceMs && ts && Date.parse(ts) < sinceMs) continue;
+        events.push(evt);
+      } catch { /* skip malformed */ }
+    }
+    return events.slice(-limit);
+  } catch { return []; }
+}
+
+function mergeTimelines(server: any[], paper: any[]): any[] {
+  const getTs = (e: any): number => {
+    const raw = e.created_at ?? e.ts ?? e.opened_at ?? "";
+    return Date.parse(raw) || 0;
+  };
+  const combined = [...server, ...paper];
+  combined.sort((a, b) => getTs(a) - getTs(b));
+  return combined;
+}
+
 async function cmdFeed(args: string[]): Promise<number> {
   const cfg = await loadConfig();
   if (!cfg.token) { process.stderr.write("not logged in (run `susu login`)\n"); return 2; }
 
-  const follow = args.includes("-f") || args.includes("--follow");
+  const snapshot = args.includes("--snapshot") || args.includes("--no-follow");
+  const follow = !snapshot;
   const bubbles = args.includes("--bubbles");
   const since = pickFlag(args, "--since");
 
@@ -1104,94 +1458,156 @@ async function cmdFeed(args: string[]): Promise<number> {
     else process.stdout.write(renderPlainLine(row, myAddress, myUsername) + "\n");
   }
 
-  // 1. History bootstrap.
+  // 1. History bootstrap — server events + local paper trading events.
   const qs = new URLSearchParams();
   qs.set("limit", String(Math.min(Math.max(limit, 1), 200)));
   if (since) qs.set("since", since);
-  const hist = await api<{ signals: FeedRow[] }>(cfg, `/signals/feed?${qs.toString()}`);
-  // Server returns DESC; reverse to chrono so the latest line lands at the
-  // bottom (matches `tail -f` mental model).
-  const ordered = [...hist.signals].reverse();
+  const hist = await api<{ events?: any[]; signals: FeedRow[] }>(cfg, `/signals/feed?${qs.toString()}`);
+  const raw = hist.events ?? hist.signals;
+  const serverEvents = [...raw].reverse();
+
+  // Merge local paper_* events into timeline so bootstrap shows the full picture.
+  const eventLogPath = `${(process.env.SUSU_HOME ?? `${process.env.HOME}/.susu`)}/events.jsonl`;
+  const paperEvents = loadRecentPaperEvents(eventLogPath, limit, since);
+  const ordered = mergeTimelines(serverEvents, paperEvents);
 
   if (bubbles && process.stdout.isTTY) {
-    process.stdout.write(`${dim("─── inbox · showing last " + ordered.length + " from server ─────────────────")}\n`);
+    process.stdout.write(`${dim("─── inbox · showing last " + ordered.length + " events ────────────────────────")}\n`);
     process.stdout.write(`${dim("─── for older runs: susu feed --since YYYY-MM-DD ────────────────────")}\n`);
     process.stdout.write(`${dim("─── tip: Terminal > Settings > Profiles > Window > Scrollback: Unlimited")}\n\n`);
   }
   for (const row of ordered) {
-    renderRow(row);
-    if (bubbles) process.stdout.write("\n");
+    if (row.kind && typeof row.kind === "string" && row.kind.startsWith("paper_")) {
+      const line = renderWireEvent(row);
+      if (line) process.stdout.write(line + "\n");
+    } else if (row.kind === "reaction") {
+      const line = renderWireEvent(row);
+      if (line) process.stdout.write(line + "\n");
+    } else {
+      renderRow(row);
+      if (bubbles) process.stdout.write("\n");
+    }
   }
 
   if (!follow) return 0;
 
-  // 2. Live tail via SSE on /signals/feed/stream.
+  // 2. Live tail via SSE on /signals/feed/stream + local event log for paper trading.
   if (bubbles && process.stdout.isTTY) {
     process.stdout.write(`${dim("─── live · Ctrl-C to exit ──────────────────────────────────────────")}\n\n`);
   } else {
     process.stderr.write("─── live (Ctrl-C to exit) ───────────────\n");
   }
 
-  // S5: header auth — see susu watch for rationale (G 🟡 #5).
+  // 2a. Tail local event log for paper_* events (written by daemon).
+  tailLocalEvents(eventLogPath, renderWireEvent);
+
+  // 2b. SSE stream from server with auto-reconnect.
   const url = `${cfg.api_url.replace(/\/$/, "")}/signals/feed/stream`;
-  const resp = await fetch(url, {
-    headers: { Authorization: `Bearer ${cfg.token}` },
-  });
-  if (!resp.ok || !resp.body) {
-    process.stderr.write(`stream error: HTTP ${resp.status}\n`);
-    return 1;
-  }
-  const reader = resp.body.getReader();
-  const decoder = new TextDecoder();
-  let buf = "";
+  let backoff = 1000;
+
   while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const parts = buf.split(/\r?\n\r?\n/);
-    buf = parts.pop() ?? "";
-    for (const block of parts) {
-      let event = "message", data = "";
-      for (const line of block.split(/\r?\n/)) {
-        if (line.startsWith("event:")) event = line.slice(6).trim();
-        else if (line.startsWith("data:")) data += line.slice(5).trim();
-      }
-      if (event === "ping") continue;
-      if (event === "open") continue;
-      if (event === "ejected" && data) {
-        try {
-          const ej = JSON.parse(data);
-          process.stderr.write(
-            `(ejected from ${ej.channel_id ?? "channel"} — reason: ${ej.reason ?? "unknown"})\n`,
-          );
-        } catch { process.stderr.write(`(ejected: ${data})\n`); }
+    try {
+      const resp = await fetch(url, {
+        headers: { Authorization: `Bearer ${cfg.token}` },
+      });
+      if (!resp.ok || !resp.body) {
+        process.stderr.write(`stream error: HTTP ${resp.status}\n`);
+        if (resp.status === 401 || resp.status === 403) return 1;
+        await new Promise((r) => setTimeout(r, backoff));
+        backoff = Math.min(backoff * 2, 30_000);
         continue;
       }
-      if (data) {
-        try {
-          const e = JSON.parse(data);
-          if (e.kind === "signal") {
-            // Backend /signals/feed/stream enriches signal events with
-            // channel_name + peer (matches /signals/feed history schema), so
-            // renderRow's recipientLabel resolves correctly for groups too.
-            renderRow(e as FeedRow);
-            if (bubbles) process.stdout.write("\n");
-          } else {
-            // BETA-1.c: non-signal events (reaction / channel_* / friend_*)
-            // get the compact wire-event one-liner. Bubble formatting is
-            // signal-specific; system events stay plain.
-            const line = renderWireEvent(e);
-            if (line) process.stdout.write(line + "\n");
+      backoff = 1000;
+      process.stderr.write("connected\n");
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const parts = buf.split(/\r?\n\r?\n/);
+        buf = parts.pop() ?? "";
+        for (const block of parts) {
+          let event = "message", data = "";
+          for (const line of block.split(/\r?\n/)) {
+            if (line.startsWith("event:")) event = line.slice(6).trim();
+            else if (line.startsWith("data:")) data += line.slice(5).trim();
           }
-        } catch (err) {
-          if (process.env.SUSU_DEBUG) {
-            process.stderr.write(`(SUSU_DEBUG feed parse error event=${event}: ${err})\n`);
+          if (event === "ping") continue;
+          if (event === "open") continue;
+          if (event === "ejected" && data) {
+            try {
+              const ej = JSON.parse(data);
+              process.stderr.write(
+                `(ejected from ${ej.channel_id ?? "channel"} — reason: ${ej.reason ?? "unknown"})\n`,
+              );
+            } catch { process.stderr.write(`(ejected: ${data})\n`); }
+            continue;
+          }
+          if (data) {
+            try {
+              const e = JSON.parse(data);
+              if (e.kind === "signal") {
+                renderRow(e as FeedRow);
+                if (bubbles) process.stdout.write("\n");
+              } else {
+                const line = renderWireEvent(e);
+                if (line) process.stdout.write(line + "\n");
+              }
+            } catch (err) {
+              if (process.env.SUSU_DEBUG) {
+                process.stderr.write(`(SUSU_DEBUG feed parse error event=${event}: ${err})\n`);
+              }
+            }
           }
         }
       }
+    } catch (err) {
+      if (process.env.SUSU_DEBUG) {
+        process.stderr.write(`(stream error: ${(err as Error)?.message ?? err})\n`);
+      }
     }
+    process.stderr.write(`(disconnected, reconnecting in ${(backoff / 1000).toFixed(0)}s...)\n`);
+    await new Promise((r) => setTimeout(r, backoff));
+    backoff = Math.min(backoff * 2, 30_000);
   }
-  return 0;
+}
+
+function tailLocalEvents(
+  filePath: string,
+  renderer: (e: any) => string | null,
+): void {
+  const fs = require("node:fs") as typeof import("node:fs");
+  let offset = 0;
+  try {
+    offset = fs.statSync(filePath).size;
+  } catch { /* file doesn't exist yet */ }
+
+  const readNew = () => {
+    try {
+      const stat = fs.statSync(filePath);
+      if (stat.size <= offset) return;
+      const fd = fs.openSync(filePath, "r");
+      const buf = Buffer.alloc(stat.size - offset);
+      fs.readSync(fd, buf, 0, buf.length, offset);
+      fs.closeSync(fd);
+      offset = stat.size;
+      const lines = buf.toString("utf8").split("\n");
+      for (const ln of lines) {
+        if (!ln.trim()) continue;
+        try {
+          const evt = JSON.parse(ln);
+          if (typeof evt.kind !== "string" || !evt.kind.startsWith("paper_")) continue;
+          const rendered = renderer(evt);
+          if (rendered) process.stdout.write(rendered + "\n");
+        } catch { /* skip malformed */ }
+      }
+    } catch { /* file gone or unreadable */ }
+  };
+
+  setInterval(readNew, 1000);
 }
 
 function pickFlag(args: string[], name: string): string | undefined {
@@ -1200,35 +1616,34 @@ function pickFlag(args: string[], name: string): string | undefined {
   return args[i + 1];
 }
 
-async function cmdInbox(args: string[]): Promise<number> {
-  // macOS-only convenience: open a new Terminal window and run the bubble
-  // feed in it. On non-mac systems we suggest the manual fallback.
-  if (process.platform !== "darwin") {
-    process.stderr.write(
-      "susu inbox is macOS-only convenience.\n" +
-      "On Linux/Windows, open any terminal and run:\n" +
-      "  susu feed --bubbles -f\n",
-    );
-    return 1;
-  }
-  // Default 200 — inbox is meant for "leave it open all day, glance at it"
-  // mode. 200 is a balance between coverage and bootstrap latency.
-  const limit = pickFlag(args, "--limit") ?? "200";
-  // Validate so attacker-influenced env can't sneak shell metas via --limit.
-  if (!/^\d{1,4}$/.test(limit)) {
-    process.stderr.write(`error: --limit must be a small positive integer, got "${limit}"\n`);
-    return 1;
-  }
-  const argv1 = process.argv[1] ?? "susu";
-  const binPath = argv1.startsWith("/") ? argv1 : "susu";
+/** Check if a feed window was already opened (by process or lock file). */
+async function isFeedRunning(): Promise<boolean> {
+  const { execSync } = await import("node:child_process");
+  try {
+    const out = execSync("pgrep -f 'feed --bubbles'", { encoding: "utf8", timeout: 3000 });
+    const pids = out.trim().split("\n").filter((p) => p && Number(p) !== process.pid);
+    if (pids.length > 0) return true;
+  } catch { /* no match */ }
+  // Also check lock file — covers the race between osascript launch and process start.
+  const fs = await import("node:fs");
+  const lockPath = (process.env.SUSU_HOME ?? `${process.env.HOME}/.susu`) + "/feed.lock";
+  try {
+    const ts = parseInt(fs.readFileSync(lockPath, "utf8").trim(), 10);
+    if (Date.now() - ts < 30_000) return true; // opened within last 30s
+  } catch { /* no lock */ }
+  return false;
+}
 
-  // S5 (G v0.0.4 review 🟡 #6): write a temp shell script and have osascript
-  // launch only the script path. Two wins over inline string concat:
-  //   - osascript only sees a we-control absolute path (we wrote it just now,
-  //     no user-controlled chars in the path components) — AppleScript escape
-  //     stops being attack surface
-  //   - env vars (SUSU_API_URL / SUSU_HOME) are quoted ONCE inside the script
-  //     via shellQuote, instead of going through two layers of escape
+/** Open a live feed in a new macOS Terminal window. Skips if one is already running. Returns true if opened. */
+async function openFeedWindow(limit = "200"): Promise<boolean> {
+  if (await isFeedRunning()) return false;
+  // Write lock file before launching.
+  const fsSync = await import("node:fs");
+  const lockPath = (process.env.SUSU_HOME ?? `${process.env.HOME}/.susu`) + "/feed.lock";
+  try { fsSync.writeFileSync(lockPath, String(Date.now())); } catch { /* best effort */ }
+  const argv1 = process.argv[1] ?? "susu";
+  const binPath = (argv1.startsWith("/") && !argv1.endsWith(".ts") && !argv1.endsWith(".js"))
+    ? argv1 : "susu";
   const fs = await import("node:fs/promises");
   const path = await import("node:path");
   const os = await import("node:os");
@@ -1243,18 +1658,29 @@ async function cmdInbox(args: string[]): Promise<number> {
   }
   lines.push(`exec ${shellQuote(binPath)} feed --bubbles -f --limit ${limit}`);
   await fs.writeFile(scriptPath, lines.join("\n") + "\n", { mode: 0o700 });
-
   const { spawn } = await import("node:child_process");
-  // scriptPath is fully under our control (mkdtemp + literal "run.sh"), so
-  // it's a known-safe ASCII string. Still escape defensively in case a
-  // future macOS tmpdir contains spaces or weird chars.
   const escaped = scriptPath.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-  const osa = `tell application "Terminal"
-  activate
-  do script "${escaped}"
-end tell`;
+  const osa = `tell application "Terminal"\n  activate\n  do script "${escaped}"\nend tell`;
   const child = spawn("osascript", ["-e", osa], { stdio: "inherit" });
   await new Promise<void>((resolve) => child.on("exit", () => resolve()));
+  return true;
+}
+
+async function cmdInbox(args: string[]): Promise<number> {
+  if (process.platform !== "darwin") {
+    process.stderr.write(
+      "susu inbox is macOS-only convenience.\n" +
+      "On Linux/Windows, open any terminal and run:\n" +
+      "  susu feed --bubbles -f\n",
+    );
+    return 1;
+  }
+  const limit = pickFlag(args, "--limit") ?? "200";
+  if (!/^\d{1,4}$/.test(limit)) {
+    process.stderr.write(`error: --limit must be a small positive integer, got "${limit}"\n`);
+    return 1;
+  }
+  await openFeedWindow(limit);
   process.stdout.write("opened inbox in a new Terminal window.\n");
   return 0;
 }
@@ -1379,6 +1805,103 @@ async function cmdConfig(args: string[]): Promise<number> {
     `session:  ${s.token ? `active until ${s.token_expires_at}` : "(none — run `susu login`)"}\n` +
     `path:     ${CONFIG_PATH}\n`,
   );
+}
+
+async function cmdBook(args: string[]): Promise<number> {
+  const path = await import("node:path");
+  const tradesPath = path.join(configDir(), "paper_trades.json");
+  let book: any;
+  try {
+    const raw = await (await import("node:fs/promises")).readFile(tradesPath, "utf8");
+    book = JSON.parse(raw);
+  } catch {
+    process.stdout.write("no paper trades yet (daemon will create on first react +1)\n");
+    return 0;
+  }
+
+  if (args.includes("--json")) {
+    process.stdout.write(JSON.stringify(book, null, 2) + "\n");
+    return 0;
+  }
+
+  const trades = book.trades ?? [];
+  const opens = trades.filter((t: any) => t.status === "open");
+  const closed = trades.filter((t: any) => t.status === "closed");
+  let balance = book.initial_balance ?? 100;
+  for (const t of closed) if (t.pnl_usd != null) balance += t.pnl_usd;
+
+  const isTTY = process.stdout.isTTY;
+  const dim = (s: string) => isTTY ? `\x1b[2m${s}\x1b[0m` : s;
+  const green = (s: string) => isTTY ? `\x1b[32m${s}\x1b[0m` : s;
+  const red = (s: string) => isTTY ? `\x1b[31m${s}\x1b[0m` : s;
+  const bold = (s: string) => isTTY ? `\x1b[1m${s}\x1b[0m` : s;
+  const pnlColor = (n: number) => n >= 0 ? green(`+${n.toFixed(2)}`) : red(n.toFixed(2));
+
+  let statsLine = "";
+  if (closed.length > 0) {
+    const wins = closed.filter((t: any) => (t.pnl_pct ?? 0) > 0);
+    const losses = closed.filter((t: any) => (t.pnl_pct ?? 0) <= 0);
+    const winRate = ((wins.length / closed.length) * 100).toFixed(0);
+    const avgWin = wins.length > 0 ? (wins.reduce((s: number, t: any) => s + (t.pnl_pct ?? 0), 0) / wins.length).toFixed(1) : "0";
+    const avgLoss = losses.length > 0 ? (losses.reduce((s: number, t: any) => s + (t.pnl_pct ?? 0), 0) / losses.length).toFixed(1) : "0";
+    statsLine = `Win: ${wins.length}/${closed.length} (${winRate}%)  Avg: +${avgWin}% / ${avgLoss}%\n`;
+  }
+  process.stdout.write(
+    `${bold("Paper Trading Book")}\n` +
+    `Balance: $${balance.toFixed(2)}  |  Open: ${opens.length}  |  Closed: ${closed.length}  |  Total: ${trades.length}\n` +
+    (statsLine ? statsLine : "") + "\n",
+  );
+
+  if (opens.length > 0) {
+    // Fetch live prices for open positions to show unrealized PnL.
+    let prices = new Map<string, number>();
+    try {
+      const symbols = [...new Set(opens.map((t: any) => t.token))].join(",");
+      const resp = await fetch("https://fapi.binance.com/fapi/v1/ticker/price", {
+        signal: AbortSignal.timeout(5_000),
+      });
+      if (resp.ok) {
+        const data = await resp.json() as { symbol: string; price: string }[];
+        const needed = new Set(opens.map((t: any) => t.token));
+        for (const d of data) {
+          if (needed.has(d.symbol)) prices.set(d.symbol, parseFloat(d.price));
+        }
+      }
+    } catch { /* best effort — show positions without live PnL if fetch fails */ }
+
+    process.stdout.write(`${bold("Open Positions")}\n`);
+    for (const t of opens) {
+      const age = ((Date.now() - new Date(t.opened_at).getTime()) / 3_600_000).toFixed(1);
+      const livePrice = prices.get(t.token);
+      let pnlStr = "";
+      if (livePrice != null) {
+        const pnlPct = ((livePrice - t.entry_price) / t.entry_price) * 100 * t.leverage;
+        const pnlUsd = (pnlPct / 100) * t.position_usd;
+        pnlStr = `  now=${livePrice}  pnl=${pnlColor(pnlPct)}% ($${pnlColor(pnlUsd)})`;
+      }
+      process.stdout.write(
+        `  #${t.id} ${t.token.padEnd(12)} ${t.direction} ${t.leverage}x  ` +
+        `entry=${t.entry_price}  SL=${t.stop_loss}  TP=${t.take_profit}` +
+        `${pnlStr}  sf=${t.size_factor}  ${dim(`${age}h ago`)}  from ${t.peer}\n`,
+      );
+    }
+    process.stdout.write("\n");
+  }
+
+  if (closed.length > 0) {
+    process.stdout.write(`${bold("Recent Closes")} ${dim("(last 10)")}\n`);
+    for (const t of closed.slice(-10)) {
+      const pnl = t.pnl_pct ?? 0;
+      const usd = t.pnl_usd ?? 0;
+      process.stdout.write(
+        `  #${t.id} ${t.token.padEnd(12)} ${(t.exit_reason ?? "?").padEnd(14)} ` +
+        `pnl=${pnlColor(pnl)}%  ($${pnlColor(usd)})  ` +
+        `best=${pnlColor(t.best_pnl_pct ?? 0)}%\n`,
+      );
+    }
+  }
+
+  return 0;
 }
 
 function printJsonOrTable<T>(args: string[], data: T, tablePrinter: (d: T) => string): number {

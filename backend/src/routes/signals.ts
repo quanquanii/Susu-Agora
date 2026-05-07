@@ -522,9 +522,12 @@ signalRoutes.get("/channels/:id/signals/stream", async (c) => {
   }
   sseConnByAddr.set(me, currentConnCount + 1);
 
+  const connectTime = Date.now();
+  const handleRow = await sql<{username: string}[]>`SELECT username FROM identities WHERE address = ${me} LIMIT 1`;
+  const handle = handleRow[0]?.username ? `@${handleRow[0].username}` : logAddr(me);
+  console.log(`[sse:channel] connect ${handle} channel=${channelId.slice(0, 8)}`);
+
   return streamSSE(c, async (stream) => {
-    // R1 fix: track abort so the wait-for-event promise can be woken,
-    // letting the loop's finally{} run (was leaking ~1 frame per disconnect).
     let aborted = false;
     let unsub = () => {};
     const queue: Event[] = [];
@@ -548,11 +551,6 @@ signalRoutes.get("/channels/:id/signals/stream", async (c) => {
       wakeWaiter();
     });
 
-    // Heartbeat: 5s. fly.io edge observed dropping idle SSE at ~9.7s (before
-    // the 10s heartbeat could land), surfacing as `terminated other side
-    // closed` on raw-fetch reproductions. 5s halves the window and gives a
-    // safety margin even if edge timeout tightens further. Pings are 14
-    // bytes; cost negligible. (post-BETA-1.b: 25s → 10s → 5s)
     const heartbeat = setInterval(() => {
       stream.writeSSE({ event: "ping", data: String(Date.now()) }).catch(() => {});
     }, 5_000);
@@ -562,6 +560,8 @@ signalRoutes.get("/channels/:id/signals/stream", async (c) => {
       clearInterval(heartbeat);
       unsub();
       wakeWaiter();
+      const dur = ((Date.now() - connectTime) / 1000).toFixed(0);
+      console.log(`[sse:channel] disconnect ${handle} channel=${channelId.slice(0, 8)} after=${dur}s reason=client_abort`);
     });
 
     try {
@@ -596,37 +596,33 @@ signalRoutes.get("/channels/:id/signals/stream", async (c) => {
         await stream.writeSSE({ event: "ejected", data: JSON.stringify(ejected) }).catch(() => {});
       }
     } catch (err) {
-      // BETA-1.b: surface the actual cause of stream death so we can tell
-      // "client TCP died" from "we wrote to a closed socket" from "DB blew
-      // up". Previously this fell silently into finally{} and the client
-      // saw a bare `error: terminated` with no server-side breadcrumb.
-      // Address logged truncated per ADR (no full pubkey in logs).
+      const dur = ((Date.now() - connectTime) / 1000).toFixed(0);
       console.warn(
-        `[sse:channel] stream broken channel=${channelId} addr=${logAddr(me)}: ${(err as Error)?.message ?? err}`,
+        `[sse:channel] disconnect ${handle} channel=${channelId.slice(0, 8)} after=${dur}s reason=error: ${(err as Error)?.message ?? err}`,
       );
     } finally {
       aborted = true;
       clearInterval(heartbeat);
       unsub();
-      // S5: drop the per-address SSE counter we incremented at the top.
       const c2 = (sseConnByAddr.get(me) ?? 1) - 1;
       if (c2 <= 0) sseConnByAddr.delete(me); else sseConnByAddr.set(me, c2);
-      // queue.length=0; the closure goes out of scope, GC reclaims everything.
     }
   });
 });
 
 // GET /signals/feed?since=ISO&limit=N — cross-channel history.
 //
-// Returns the caller's most recent signals across every channel they're a
-// member of, ordered by created_at DESC (most recent first). Used by:
+// Returns the caller's most recent events (signals + reactions) across every
+// channel they're a member of, ordered by created_at DESC (most recent first).
+// Each row carries a `kind` discriminator ("signal" | "reaction") so clients
+// can dispatch rendering. Used by:
 //   - human-side `susu feed` (terminal log of all my agent's chatter)
 //   - human-side `susu inbox` (bubble-UI window initial bootstrap)
 //   - agent-side `susu_signals_feed` MCP tool (catch up on inbox in one call)
 //
-// Channel labels are computed in SQL: 1-on-1 → peer's @handle (or truncated
-// address fallback), group → channel.name (or short channel_id). This means
-// the client doesn't need to do per-channel friend lookups.
+// Response: { events: [...], signals: [...] }
+// `events` = unified timeline (signals + reactions interleaved by time).
+// `signals` = same as `events` (backward-compat alias — older CLIs read this).
 signalRoutes.get("/signals/feed", async (c) => {
   let me: string;
   try { me = await withAuth(c); } catch (e) { return authError(c, e); }
@@ -653,66 +649,76 @@ signalRoutes.get("/signals/feed", async (c) => {
     }
   }
 
-  // Both branches return DESC order (newest first). Clients that want a
-  // chrono "tail -f" view reverse client-side; clients that want "newest
-  // first" (e.g. inbox bootstrap displaying top-of-list) consume as-is.
-  // Keeping ORDER consistent across `since` / no-`since` so client logic
-  // is the same for both. (G review #1)
-  const rows = since
-    ? await sql<any[]>`
-        SELECT s.signal_id,
-               s.channel_id,
-               s.from_address,
-               i.username AS from_username,
-               s.payload,
-               s.created_at,
-               c.name AS channel_name,
-               (
-                 SELECT json_build_object(
-                   'address', cm2.address,
-                   'username', i2.username
-                 )
-                 FROM channel_members cm2
-                 LEFT JOIN identities i2 ON i2.address = cm2.address
-                 WHERE cm2.channel_id = s.channel_id AND cm2.address <> ${me}
-                 LIMIT 1
-               ) AS peer
-        FROM signals s
-        JOIN channel_members cm ON cm.channel_id = s.channel_id AND cm.address = ${me}
-        JOIN channels c ON c.channel_id = s.channel_id
-        LEFT JOIN identities i ON i.address = s.from_address
-        WHERE s.created_at > ${since}
-        ORDER BY s.created_at DESC LIMIT ${limit}
-      `
-    : await sql<any[]>`
-        SELECT s.signal_id,
-               s.channel_id,
-               s.from_address,
-               i.username AS from_username,
-               s.payload,
-               s.created_at,
-               c.name AS channel_name,
-               (
-                 SELECT json_build_object(
-                   'address', cm2.address,
-                   'username', i2.username
-                 )
-                 FROM channel_members cm2
-                 LEFT JOIN identities i2 ON i2.address = cm2.address
-                 WHERE cm2.channel_id = s.channel_id AND cm2.address <> ${me}
-                 LIMIT 1
-               ) AS peer
-        FROM signals s
-        JOIN channel_members cm ON cm.channel_id = s.channel_id AND cm.address = ${me}
-        JOIN channels c ON c.channel_id = s.channel_id
-        LEFT JOIN identities i ON i.address = s.from_address
-        ORDER BY s.created_at DESC LIMIT ${limit}
-      `;
+  // UNION signals + reactions into one timeline, ordered by created_at DESC.
+  // Each row carries `kind` so clients can dispatch rendering.
+  // peer subquery is attached to both branches for consistent label formatting.
+  const sinceClause = since ? sql`WHERE created_at > ${since}` : sql``;
+  const rows = await sql<any[]>`
+    SELECT * FROM (
+      SELECT 'signal'::text AS kind,
+             s.signal_id,
+             NULL::uuid AS reaction_id,
+             s.channel_id,
+             s.from_address,
+             i.username AS from_username,
+             s.payload,
+             s.created_at,
+             c.name AS channel_name,
+             NULL::uuid AS parent_signal_id,
+             false AS is_auto,
+             (
+               SELECT json_build_object(
+                 'address', cm2.address,
+                 'username', i2.username
+               )
+               FROM channel_members cm2
+               LEFT JOIN identities i2 ON i2.address = cm2.address
+               WHERE cm2.channel_id = s.channel_id AND cm2.address <> ${me}
+               LIMIT 1
+             ) AS peer
+      FROM signals s
+      JOIN channel_members cm ON cm.channel_id = s.channel_id AND cm.address = ${me}
+      JOIN channels c ON c.channel_id = s.channel_id
+      LEFT JOIN identities i ON i.address = s.from_address
+
+      UNION ALL
+
+      SELECT 'reaction'::text AS kind,
+             NULL::uuid AS signal_id,
+             r.reaction_id,
+             sig.channel_id,
+             r.from_address,
+             i.username AS from_username,
+             r.payload,
+             r.created_at,
+             c.name AS channel_name,
+             r.signal_id AS parent_signal_id,
+             r.is_auto,
+             (
+               SELECT json_build_object(
+                 'address', cm2.address,
+                 'username', i2.username
+               )
+               FROM channel_members cm2
+               LEFT JOIN identities i2 ON i2.address = cm2.address
+               WHERE cm2.channel_id = sig.channel_id AND cm2.address <> ${me}
+               LIMIT 1
+             ) AS peer
+      FROM reactions r
+      JOIN signals sig ON sig.signal_id = r.signal_id
+      JOIN channel_members cm ON cm.channel_id = sig.channel_id AND cm.address = ${me}
+      JOIN channels c ON c.channel_id = sig.channel_id
+      LEFT JOIN identities i ON i.address = r.from_address
+    ) unified
+    ${sinceClause}
+    ORDER BY created_at DESC LIMIT ${limit}
+  `;
   // S5: cap each row's payload so feed bootstrap stays bounded even if
   // a malicious peer pushed 64KB messages. Original stays in DB; clients
   // wanting the full row can fetch via /channels/{id}/signals.
   for (const r of rows) r.payload = truncatePayloadForFeed(r.payload);
-  return c.json({ signals: rows });
+  // `events` is the canonical key; `signals` kept for backward compat.
+  return c.json({ events: rows, signals: rows });
 });
 
 // GET /signals/feed/stream — SSE fan-in across all the caller's channels.
@@ -773,12 +779,13 @@ signalRoutes.get("/signals/feed/stream", async (c) => {
     channelMeta.set(r.channel_id, { channel_name: r.channel_name, peer: r.peer });
   }
 
+  const connectTime = Date.now();
+  const handleRow = await sql<{username: string}[]>`SELECT username FROM identities WHERE address = ${me} LIMIT 1`;
+  const handle = handleRow[0]?.username ? `@${handleRow[0].username}` : logAddr(me);
+  console.log(`[sse:feed] connect ${handle} channels=${channelMeta.size}`);
+
   return streamSSE(c, async (stream) => {
     let aborted = false;
-    // queue carries enriched events: channel-scope events get channel meta
-    // merged in; user-scope events (friend_*, channel_invited/created) come
-    // through without channel-meta enrichment (they aren't tied to a single
-    // existing channel in the user's view).
     type EnrichedEvent = Event & Partial<FeedStreamMeta>;
     const queue: EnrichedEvent[] = [];
     let resolveWaiter: (() => void) | null = null;
@@ -842,11 +849,6 @@ signalRoutes.get("/signals/feed/stream", async (c) => {
     });
     unsubs.push(unregExtender);
 
-    // Heartbeat: 5s. fly.io edge observed dropping idle SSE at ~9.7s (before
-    // the 10s heartbeat could land), surfacing as `terminated other side
-    // closed` on raw-fetch reproductions. 5s halves the window and gives a
-    // safety margin even if edge timeout tightens further. Pings are 14
-    // bytes; cost negligible. (post-BETA-1.b: 25s → 10s → 5s)
     const heartbeat = setInterval(() => {
       stream.writeSSE({ event: "ping", data: String(Date.now()) }).catch(() => {});
     }, 5_000);
@@ -856,6 +858,8 @@ signalRoutes.get("/signals/feed/stream", async (c) => {
       clearInterval(heartbeat);
       for (const u of unsubs) u();
       wakeWaiter();
+      const dur = ((Date.now() - connectTime) / 1000).toFixed(0);
+      console.log(`[sse:feed] disconnect ${handle} after=${dur}s reason=client_abort`);
     });
 
     try {
@@ -892,16 +896,14 @@ signalRoutes.get("/signals/feed/stream", async (c) => {
         }
       }
     } catch (err) {
-      // BETA-1.b: surface stream death cause; see channel handler for rationale.
-      // Address logged truncated per ADR (no full pubkey in logs).
+      const dur = ((Date.now() - connectTime) / 1000).toFixed(0);
       console.warn(
-        `[sse:feed] stream broken addr=${logAddr(me)}: ${(err as Error)?.message ?? err}`,
+        `[sse:feed] disconnect ${handle} after=${dur}s reason=error: ${(err as Error)?.message ?? err}`,
       );
     } finally {
       aborted = true;
       clearInterval(heartbeat);
       for (const u of unsubs) u();
-      // S5: drop the per-address SSE counter we incremented at the top.
       const c2 = (sseConnByAddr.get(me) ?? 1) - 1;
       if (c2 <= 0) sseConnByAddr.delete(me); else sseConnByAddr.set(me, c2);
     }
