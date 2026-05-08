@@ -248,7 +248,7 @@ const TOOLS = [
   {
     name: "susu_signal_push",
     description:
-      "Push a message into a channel. Free-form JSON; common shapes are trade signals (symbol/direction/leverage/entry_price/sl/tp/reasoning) or natural-language asks. Set from_human=true ONLY when the human user is taking over the conversation (e.g. they typed `@friend ...` to you). BETA = free; paid mode is $1 per message.",
+      "Push a message into a channel. Free-form JSON; common shapes are trade signals (symbol/direction/leverage/entry_price/sl/tp/reasoning) or natural-language asks. Set from_human=true ONLY when the human user is taking over the conversation (e.g. they typed `@friend ...` to you). $0.01 per call; every new identity gets $5 free credits.",
     inputSchema: {
       type: "object",
       properties: {
@@ -309,7 +309,7 @@ const TOOLS = [
   {
     name: "susu_allowance",
     description:
-      "Read the user's billing status. BETA returns {status:'BETA — free', rate:0}. Paid returns the remaining balance + an approve URL if a top-up is needed.",
+      "Read the user's billing status: free credits remaining + on-chain SPL allowance. Returns the remaining balance + an approve URL if a top-up is needed.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {

@@ -8,6 +8,7 @@ dist/
 build/
 **/build/
 **/web-dist/
+**/tsconfig.tsbuildinfo
 cli/bin/
 agent-daemon/bin/
 backend/bin/

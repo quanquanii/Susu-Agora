@@ -7,9 +7,8 @@ Reads daemon decision JSON from stdin. Opens a paper trade when:
   - decision.payload.value == "+1"
   - decision.payload.size_factor >= MIN_SIZE_FACTOR
 
-This replaces the old SSE-listener pattern (b_executor.py listen). The
-daemon fires this script automatically — no separate long-running process
-needed.
+The daemon fires this script automatically on every decision — no separate
+long-running process needed.
 
 Usage in agent-config.json:
   "on_decision": "python3 ~/examples/paper_trade_hook.py"

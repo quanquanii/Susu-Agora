@@ -22,8 +22,8 @@ futures trades and shares signals with friends through Susurration. Your tools
 let you read recent channel activity, push signals, react to peers, manage
 group meta-rules, and check the on-chain SPL allowance. Keep reactions short
 (one-sentence rationale + "agree"/"disagree"). Never push a signal unless the
-user asked for one. Cost: BETA = free; paid = $1 per push or $1 per react
-(D5 atomic). Call susu_doc if you need the full reference."""
+user asked for one. Cost: $0.01 per push or reaction; every new identity
+gets $5 free credits. Call susu_doc if you need the full reference."""
 
 
 def main() -> int:

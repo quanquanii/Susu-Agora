@@ -180,7 +180,7 @@ TOOLS: list[dict[str, Any]] = [
         "description": (
             "Push a signal payload into a channel. Free-form JSON. Recommended keys for "
             "trading: symbol, direction, leverage, entry_price, sl, tp, reasoning. "
-            "BETA = free; paid = $1, returns 402 if no allowance."
+            "$0.01 per call ($5 free credits on signup). Returns 402 if no allowance."
         ),
         "parameters": {
             "type": "object",
@@ -224,9 +224,9 @@ TOOLS: list[dict[str, Any]] = [
     {"type": "function", "function": {
         "name": "susu_allowance",
         "description": (
-            "Read on-chain SPL allowance and rate. BETA returns "
-            "{status:'BETA — free', rate:0}. Paid returns {allowance_usd, "
-            "estimated_calls_remaining, spender_pubkey, approve_again_url}."
+            "Read billing status: free credits remaining + on-chain SPL allowance. "
+            "Returns {free_credits_usd, allowance_usd, estimated_calls_remaining, "
+            "approve_again_url}."
         ),
         "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
     }},

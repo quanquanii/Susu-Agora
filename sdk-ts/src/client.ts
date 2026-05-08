@@ -208,8 +208,8 @@ export class SusuClient {
   // ── signals + reactions ───────────────────────────────────────────────
 
   /** Push a signal. Accepts a typed SignalTemplate, plain object, or string.
-   *  String is wrapped into `{text: ...}`. Costs $1 in paid mode (D5 atomic);
-   *  free in BETA. Throws `InsufficientAllowanceError` on 402. */
+   *  String is wrapped into `{text: ...}`. $0.01 per call; every new identity
+   *  gets $5 free credits. Throws `InsufficientAllowanceError` on 402. */
   pushSignal(channelId: string, payload: SignalTemplate | Record<string, unknown> | string) {
     const body = typeof payload === "string" ? { text: payload } : payload;
     return this.req<Signal & { cost_usd: number; allowance_after?: Allowance }>(
@@ -262,7 +262,7 @@ export class SusuClient {
     }
   }
 
-  /** React to a peer's signal. Costs $1 in paid mode (D5 atomic); free in BETA. */
+  /** React to a peer's signal. $0.01 per call; every new identity gets $5 free credits. */
   pushReaction(signalId: string, payload: unknown, opts: { is_auto?: boolean } = {}) {
     return this.req<Reaction & { cost_usd: number; allowance_after?: Allowance }>(
       "POST", `/signals/${signalId}/reactions`, { payload, is_auto: !!opts.is_auto },

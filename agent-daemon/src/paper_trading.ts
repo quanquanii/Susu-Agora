@@ -13,7 +13,7 @@
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
-// ── Default strategy constants (same as GS-pro scanner_paper.py) ────────
+// ── Default strategy constants ──────────────────────────────────────────
 const DEFAULT_LEVERAGE = 3;
 const DEFAULT_POSITION_PCT = 30;   // % of balance per trade
 const DEFAULT_SL_PCT = 0.08;       // 8% below entry

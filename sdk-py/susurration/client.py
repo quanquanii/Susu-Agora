@@ -173,7 +173,7 @@ class SusuClient:
     # ── signals + reactions ──────────────────────────────────────────
 
     def push_signal(self, channel_id: str, payload: Mapping[str, Any] | str) -> dict:
-        """Push a signal. Costs $1 in paid mode (D5 atomic). Free in BETA."""
+        """Push a signal. $0.01 per call; every new identity gets $5 free credits."""
         body = {"text": payload} if isinstance(payload, str) else dict(payload)
         return self._req("POST", f"/channels/{channel_id}/signals", body)
 
@@ -210,7 +210,7 @@ class SusuClient:
                     data_buf.append(line[5:].strip())
 
     def push_reaction(self, signal_id: str, payload: Any, is_auto: bool = False) -> dict:
-        """React to a peer's signal. Costs $1 in paid mode (D5 atomic). Free in BETA."""
+        """React to a peer's signal. $0.01 per call; every new identity gets $5 free credits."""
         return self._req("POST", f"/signals/{signal_id}/reactions", {"payload": payload, "is_auto": is_auto})
 
     def list_reactions(self, signal_id: str) -> dict:
