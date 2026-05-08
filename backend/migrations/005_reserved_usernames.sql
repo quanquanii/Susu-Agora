@@ -7,7 +7,7 @@
 --                  routes / platform identity / future feature paths.
 --
 --   `rare`       — Default-locked. Grantable to a specific address by admin
---                  (whitelist mechanism — sghy hands out short names to
+--                  (whitelist mechanism — admin hands out short names to
 --                  high-value users / dogfood operators). Recipient registers
 --                  the name normally; the reserved row's granted_to gates it.
 --                  3-4 character names are NOT enumerated here — they're
@@ -19,7 +19,7 @@
 --
 -- (We deliberately do NOT pre-reserve third-party brand names. Per GitHub /
 -- X / WeChat-Official-Account practice, brand protection is claim-based:
--- trademark holders submit proof, then sghy adds them to `system` retroactively.)
+-- trademark holders submit proof, then admin adds them to `system` retroactively.)
 
 CREATE TABLE reserved_usernames (
   username    TEXT PRIMARY KEY CHECK (username ~ '^[a-z0-9_-]{1,40}$'),

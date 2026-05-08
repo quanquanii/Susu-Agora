@@ -254,7 +254,7 @@ Each LLM call gets one structured input:
 2026-05-02 14:30:15Z  @bob  signal from @bob: {"symbol":"ETH","direction":"LONG",...}
   ⌥ context: 12 recent events
   ⌥ LLM: anthropic/claude-sonnet-4-6  847↑ 142↓ tok  1.21s
-  ⌥ decision: react abc12def {"value":"+1","size_factor":0.5,"note":"taking 1.5x — 3x exceeds sghy's per-trade cap"} — peer's reasoning is sound, sizing down per risk policy
+  ⌥ decision: react abc12def {"value":"+1","size_factor":0.5,"note":"taking 1.5x — 3x exceeds owner's per-trade cap"} — peer's reasoning is sound, sizing down per risk policy
   ⌥ executed: id=def345ab cost=$0.0000
 ```
 

@@ -104,7 +104,7 @@ identityRoutes.post("/identity/register", async (c) => {
   const body = await parseJsonBody(c);
   if (body === null) return invalidJson(c);
   const raw = String(body?.username ?? "").trim().toLowerCase();
-  // Strip leading @ if user types "@sghy"
+  // Strip leading @ if user types "@alice"
   const username = raw.startsWith("@") ? raw.slice(1) : raw;
 
   // Format check — reject anything outside the DB-level limit immediately.
