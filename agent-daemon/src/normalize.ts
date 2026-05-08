@@ -42,6 +42,11 @@ export function normalizeSignalPayload(raw: Record<string, unknown>): NormalizeR
     }
   }
 
+  // Normalize direction value to lowercase ("LONG" → "long").
+  if (typeof out.direction === "string") {
+    out.direction = out.direction.toLowerCase();
+  }
+
   // Metadata alias mapping
   if (out.metadata && typeof out.metadata === "object") {
     const meta = { ...(out.metadata as Record<string, unknown>) };
@@ -72,6 +77,14 @@ export function normalizeSignalPayload(raw: Record<string, unknown>): NormalizeR
     }
     if (Object.keys(meta).length > 0) {
       out.metadata = meta;
+      // Clean up top-level fields now moved into metadata to avoid
+      // duplicate data in LLM context.
+      const movedKeys = new Set([
+        ...Object.keys(META_ALIASES),
+        "entry_price", "stop_loss", "take_profit", "leverage",
+        "time_stop_hours", "position_pct",
+      ]);
+      for (const key of movedKeys) delete out[key];
     }
   }
 

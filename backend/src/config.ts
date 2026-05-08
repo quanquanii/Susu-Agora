@@ -5,9 +5,13 @@ export const config = {
   databaseUrl:
     process.env.DATABASE_URL ?? "postgres://susu:susu_dev@localhost:5432/susurration",
 
-  // D5 atomic billing rule. Dogfood = 0, post-calibration = 1.
+  // D5 atomic billing rule. Per-signal/reaction charge in USD.
   // Float so we can experiment with $0.50 etc without code changes.
-  billingRateUsd: Number(process.env.BILLING_RATE_USD ?? 0),
+  billingRateUsd: Number(process.env.BILLING_RATE_USD ?? 0.01),
+
+  // Free credits: $5.00 per new identity (migration 007 DEFAULT).
+  // Not runtime-configurable — change the migration DEFAULT to adjust.
+  // Kept here as documentation only; meter() reads from DB, not config.
 
   // Solana cluster. devnet during dev, mainnet-beta in prod.
   solanaCluster: process.env.SOLANA_CLUSTER ?? "devnet",

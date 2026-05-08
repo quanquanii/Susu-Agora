@@ -113,8 +113,10 @@ export class PaperTrader {
     }
   }
 
-  /** Called after every daemon decision. Opens on react +1 above threshold. */
-  onDecision(decision: any, trigger: any): void {
+  /** Called after every daemon decision. Opens on react +1 above threshold.
+   *  @param origSignalPayload — when trigger is a reaction, the normalized
+   *    payload of the original signal (has token, entry_price, etc.). */
+  onDecision(decision: any, trigger: any, origSignalPayload?: Record<string, unknown>): void {
     if (decision?.kind !== "react") return;
     const p = decision.payload ?? {};
     if (p.value !== "+1") return;
@@ -122,16 +124,28 @@ export class PaperTrader {
     // some models still skip it). 0.7 = "moderate conviction" — ensures
     // a +1 always opens a position rather than silently dropping.
     const sf = typeof p.size_factor === "number" ? p.size_factor : 0.7;
-    if (sf < this.minSizeFactor) {
+
+    // Use original signal payload when trigger is a reaction.
+    const sigPayload = origSignalPayload ?? trigger?.payload ?? {};
+
+    // Only open positions for trade_entry signals (or signals with no type field).
+    // Prevents opening on trade_exit, smoke_test, relay_path_fix, etc.
+    const sigType = sigPayload.type as string | undefined;
+    if (sigType && sigType !== "trade_entry") {
       const peer: string = trigger?.from_username ?? "?";
-      const token: string = trigger?.payload?.token ?? "?";
-      process.stderr.write(`[paper] skip react +1 ${token} from ${peer}: size_factor ${sf} < min ${this.minSizeFactor}\n`);
-      this.emitEvent({ kind: "paper_skip", ts: new Date().toISOString(), reason: `size_factor ${sf} < min ${this.minSizeFactor}`, token, peer, sf });
+      process.stderr.write(`[paper] skip react +1 from ${peer}: signal type="${sigType}" (only trade_entry opens positions)\n`);
+      this.emitEvent({ kind: "paper_skip", ts: new Date().toISOString(), reason: `signal type="${sigType}" not trade_entry`, token: (sigPayload.token as string) ?? "?", peer });
       return;
     }
 
-    const sigPayload = trigger?.payload ?? {};
-    const token: string | undefined = sigPayload.token;
+    const token: string | undefined = sigPayload.token as string | undefined;
+
+    if (sf < this.minSizeFactor) {
+      const peer: string = trigger?.from_username ?? "?";
+      process.stderr.write(`[paper] skip react +1 ${token ?? "?"} from ${peer}: size_factor ${sf} < min ${this.minSizeFactor}\n`);
+      this.emitEvent({ kind: "paper_skip", ts: new Date().toISOString(), reason: `size_factor ${sf} < min ${this.minSizeFactor}`, token: token ?? "?", peer, sf });
+      return;
+    }
     const direction: string = sigPayload.direction ?? "long";
     if (direction !== "long" && direction !== "short") {
       const peer: string = trigger?.from_username ?? "?";

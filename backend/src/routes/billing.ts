@@ -31,7 +31,9 @@ function authError(c: Context, e: unknown) {
 export async function buildAllowanceResponse(address: string): Promise<{
   address: string;
   rate_usd_per_call: number;
-  status: "BETA — free" | "paid";
+  status: "free_credits" | "paid" | "BETA — free";
+  free_credits_usd: number;
+  free_credits_calls_remaining: number;
   allowance_usd: number | null;
   estimated_calls_remaining: number | null;
   spender_pubkey: string | null;
@@ -44,11 +46,20 @@ export async function buildAllowanceResponse(address: string): Promise<{
   const usdcMint = config.usdcMint;
   const approveUrl = `https://susurration.xyz/approve?amount=100`;
 
+  // Read free credits from DB.
+  const creditRows = await sql<{ free_credits_usd: string }[]>`
+    SELECT free_credits_usd FROM identities WHERE address = ${address}
+  `;
+  const freeCredits = Number(creditRows[0]?.free_credits_usd ?? 0);
+  const freeCallsRemaining = rate > 0 ? Math.floor(freeCredits / rate) : 0;
+
   if (rate === 0) {
     return {
       address,
       rate_usd_per_call: 0,
       status: "BETA — free",
+      free_credits_usd: freeCredits,
+      free_credits_calls_remaining: freeCallsRemaining,
       allowance_usd: null,
       estimated_calls_remaining: null,
       spender_pubkey: null,
@@ -58,7 +69,10 @@ export async function buildAllowanceResponse(address: string): Promise<{
     };
   }
 
-  // Paid mode — read on-chain allowance.
+  // Determine status: using free credits or on-chain paid.
+  const usingFreeCredits = freeCredits >= rate;
+
+  // Read on-chain allowance (needed even while on credits, for transparency).
   let spender: string | null = null;
   let allowance = 0;
   try {
@@ -71,9 +85,11 @@ export async function buildAllowanceResponse(address: string): Promise<{
   return {
     address,
     rate_usd_per_call: rate,
-    status: "paid",
+    status: usingFreeCredits ? "free_credits" : "paid",
+    free_credits_usd: freeCredits,
+    free_credits_calls_remaining: freeCallsRemaining,
     allowance_usd: allowance,
-    estimated_calls_remaining: rate > 0 ? Math.floor(allowance / rate) : null,
+    estimated_calls_remaining: rate > 0 ? Math.floor((freeCredits + allowance) / rate) : null,
     spender_pubkey: spender,
     usdc_mint: usdcMint,
     cluster,

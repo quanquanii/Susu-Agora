@@ -1,11 +1,12 @@
-// D5 atomic billing rule + non-custodial charge path.
+// D5 atomic billing rule + free credits + non-custodial charge path.
 //
-// rate=0 (BETA): write usage_log row with cost=0, skip on-chain charge entirely.
-// rate>0 (paid): chargeUser() does an SPL TransferChecked on-chain (synchronous,
-//   ~400ms-2s); on InsufficientAllowanceError throw a typed error the route
-//   surfaces as 402 with approve_again_url.
+// Charge priority:
+//   1. Free credits (DB-side, fast, no on-chain call)
+//   2. On-chain USDC via spender keypair (400ms-2s)
+//   3. 402 Insufficient — neither credits nor allowance
 //
-// silent skip = no row (free).
+// rate=0 (legacy BETA override): write usage_log row with cost=0, skip charge.
+// rate>0: deduct from free_credits_usd first; if exhausted, chargeUser() on-chain.
 
 import type { Querier } from "./db.ts";
 import { config } from "./config.ts";
@@ -25,29 +26,36 @@ export interface MeterArgs {
 // Re-export so route handlers can import from a single place.
 export { InsufficientAllowanceError };
 
-/** Rate-aware atomic charge.
- *  - rate=0: write 0-cost usage_log row, return.
- *  - rate>0: chargeUser() (SPL TransferChecked); on confirm, write usage_log row.
+/** Rate-aware atomic charge with free credits fallback.
  *
- *  The on-chain charge happens BEFORE the usage_log INSERT — if the chain call
- *  fails (insufficient allowance, RPC error), no row is written, no business
- *  state mutates. The caller's outer transaction will still run, but since
- *  this throws, the route handler returns 402/500 before COMMIT.
+ *  1. If rate=0: write 0-cost usage_log, return (legacy BETA).
+ *  2. If user has free_credits_usd >= cost: atomically deduct in DB, no on-chain.
+ *  3. Else: chargeUser() on-chain (SPL TransferChecked).
+ *     - InsufficientAllowanceError → route catches → 402.
+ *     - RPC/network error → unhandled → route returns 500.
  *
- *  IMPORTANT: caller's tx may roll back AFTER chargeUser() succeeds. In that
- *  case we've moved real USDC on-chain but DB shows no usage. usage_log row
- *  is best-effort consistency. We accept this tradeoff because:
- *    1. usage_log is for transparency, not for re-debiting (charges are on-chain)
- *    2. tx rollback after an external on-chain commit is rare
- *    3. truth is on-chain (allowance decreases regardless of DB state)
+ *  Free credits deduction is inside the caller's DB transaction (atomic).
+ *  On-chain charge is external — same tradeoff as before: tx rollback after
+ *  successful on-chain charge is rare and acceptable (truth is on-chain).
  */
 export async function meter(args: MeterArgs): Promise<{ cost_usd: number; usage_id: string }> {
   const cost = config.billingRateUsd;
 
   if (cost > 0) {
-    // chargeUser may take 400ms-2s synchronously while we wait for confirmation.
-    // The InsufficientAllowanceError path is the 402 trigger.
-    await chargeUser({ userAddress: args.address, amountUsd: cost });
+    // Try free credits first (atomic DB deduct, no on-chain call).
+    const credited = await args.tx<{ free_credits_usd: string }[]>`
+      UPDATE identities
+      SET free_credits_usd = free_credits_usd - ${cost}
+      WHERE address = ${args.address}
+        AND free_credits_usd >= ${cost}
+      RETURNING free_credits_usd
+    `;
+
+    if (credited.length === 0) {
+      // No free credits left — fall through to on-chain charge.
+      // chargeUser may take 400ms-2s synchronously.
+      await chargeUser({ userAddress: args.address, amountUsd: cost });
+    }
   }
 
   const rows = await args.tx<{ usage_id: string }[]>`

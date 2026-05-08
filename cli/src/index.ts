@@ -905,6 +905,7 @@ async function cmdPush(args: string[]): Promise<number> {
       if (o.allowance_after) {
         const a = o.allowance_after;
         if (a.status === "BETA — free") lines.push(`status:    BETA — free`);
+        else if (a.free_credits_usd > 0) lines.push(`credits:   $${Number(a.free_credits_usd).toFixed(2)} (${a.free_credits_calls_remaining} calls)`);
         else lines.push(`allowance: $${Number(a.allowance_usd ?? 0).toFixed(4)} (${a.estimated_calls_remaining ?? "?"} calls remaining)`);
       }
       return lines.join("\n") + "\n";
@@ -912,8 +913,9 @@ async function cmdPush(args: string[]): Promise<number> {
   } catch (e) {
     if (e instanceof ApiError && e.status === 402) {
       const b = e.body ?? {};
+      const creditNote = b.free_credits_exhausted ? " (free credits exhausted)" : "";
       process.stderr.write(
-        `insufficient_allowance: $${Number(b.allowance_usd ?? 0).toFixed(4)} < $${Number(b.required_usd ?? 0).toFixed(4)}\n` +
+        `insufficient_allowance${creditNote}: $${Number(b.allowance_usd ?? 0).toFixed(4)} < $${Number(b.required_usd ?? 0).toFixed(4)}\n` +
         `run \`susu approve\` (or open ${b.approve_again_url ?? "https://susurration.xyz/approve"}) to top up.\n`,
       );
       return 1;
@@ -937,6 +939,7 @@ async function cmdReact(args: string[]): Promise<number> {
       if (o.allowance_after) {
         const a = o.allowance_after;
         if (a.status === "BETA — free") lines.push(`status:      BETA — free`);
+        else if (a.free_credits_usd > 0) lines.push(`credits:     $${Number(a.free_credits_usd).toFixed(2)} (${a.free_credits_calls_remaining} calls)`);
         else lines.push(`allowance:   $${Number(a.allowance_usd ?? 0).toFixed(4)}`);
       }
       return lines.join("\n") + "\n";
@@ -944,8 +947,9 @@ async function cmdReact(args: string[]): Promise<number> {
   } catch (e) {
     if (e instanceof ApiError && e.status === 402) {
       const b = e.body ?? {};
+      const creditNote = b.free_credits_exhausted ? " (free credits exhausted)" : "";
       process.stderr.write(
-        `insufficient_allowance: $${Number(b.allowance_usd ?? 0).toFixed(4)} < $${Number(b.required_usd ?? 0).toFixed(4)}\n` +
+        `insufficient_allowance${creditNote}: $${Number(b.allowance_usd ?? 0).toFixed(4)} < $${Number(b.required_usd ?? 0).toFixed(4)}\n` +
         `run \`susu approve\` to top up.\n`,
       );
       return 1;
@@ -1703,11 +1707,15 @@ async function cmdAllowance(args: string[]): Promise<number> {
         `(when paid mode flips on, your first push will return 402 + an approve URL)\n`
       );
     }
+    const creditLine = o.free_credits_usd > 0
+      ? `free_credits:    $${Number(o.free_credits_usd).toFixed(2)} (${o.free_credits_calls_remaining} calls)\n`
+      : `free_credits:    exhausted\n`;
     return (
-      `status:          paid\n` +
+      `status:          ${o.status}\n` +
       `rate_per_call:   $${o.rate_usd_per_call}\n` +
+      creditLine +
       `allowance_usd:   $${Number(o.allowance_usd ?? 0).toFixed(4)}\n` +
-      `calls_remaining: ${o.estimated_calls_remaining ?? "?"}\n` +
+      `calls_remaining: ${o.estimated_calls_remaining ?? "?"} (credits + allowance)\n` +
       `cluster:         ${o.cluster}\n` +
       `\nApprove top-up:  ${o.approve_again_url}\n` +
       `(or run: susu approve [<amount_usd>])\n`

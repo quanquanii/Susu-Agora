@@ -23,12 +23,9 @@ primary_region = "sin"
   SUSU_SERVE_WEB = "1"
   SUSU_WEB_ROOT = "/app/web/dist"
 
-  # BETA period: rate=0 means push & react are FREE; allowance/spender
-  # endpoints return BETA shape. To flip to paid mode (post-launch
-  # calibration): `fly secrets set BILLING_RATE_USD=1` (or change here +
-  # redeploy). The cluster will need to flip in the same release — see
-  # Cluster section below.
-  BILLING_RATE_USD = "0"
+  # Per-signal/reaction charge in USD. $0.01/call with $5 free credits
+  # per new identity (migration 007). Set to "0" to revert to free BETA.
+  BILLING_RATE_USD = "0.01"
 
   # Cluster / chain config. BETA stays on devnet (no real USDC at risk).
   # Paid-mode flip → set both of these to mainnet values in the same deploy.

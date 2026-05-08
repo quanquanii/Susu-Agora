@@ -25,6 +25,7 @@ const APPROVE_AGAIN_URL = "https://susurration.xyz/approve?amount=100";
 function insufficientAllowance(c: any, e: InsufficientAllowanceError) {
   return c.json({
     error: "insufficient_allowance",
+    free_credits_exhausted: true,
     allowance_usd: e.allowance_usd,
     required_usd: e.required_usd,
     approve_again_url: APPROVE_AGAIN_URL,

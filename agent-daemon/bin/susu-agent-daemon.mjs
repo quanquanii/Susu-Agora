@@ -15156,23 +15156,30 @@ class PaperTrader {
       this.trackTimer = null;
     }
   }
-  onDecision(decision, trigger) {
+  onDecision(decision, trigger, origSignalPayload) {
     if (decision?.kind !== "react")
       return;
     const p2 = decision.payload ?? {};
     if (p2.value !== "+1")
       return;
     const sf = typeof p2.size_factor === "number" ? p2.size_factor : 0.7;
-    if (sf < this.minSizeFactor) {
+    const sigPayload = origSignalPayload ?? trigger?.payload ?? {};
+    const sigType = sigPayload.type;
+    if (sigType && sigType !== "trade_entry") {
       const peer2 = trigger?.from_username ?? "?";
-      const token2 = trigger?.payload?.token ?? "?";
-      process.stderr.write(`[paper] skip react +1 ${token2} from ${peer2}: size_factor ${sf} < min ${this.minSizeFactor}
+      process.stderr.write(`[paper] skip react +1 from ${peer2}: signal type="${sigType}" (only trade_entry opens positions)
 `);
-      this.emitEvent({ kind: "paper_skip", ts: new Date().toISOString(), reason: `size_factor ${sf} < min ${this.minSizeFactor}`, token: token2, peer: peer2, sf });
+      this.emitEvent({ kind: "paper_skip", ts: new Date().toISOString(), reason: `signal type="${sigType}" not trade_entry`, token: sigPayload.token ?? "?", peer: peer2 });
       return;
     }
-    const sigPayload = trigger?.payload ?? {};
     const token = sigPayload.token;
+    if (sf < this.minSizeFactor) {
+      const peer2 = trigger?.from_username ?? "?";
+      process.stderr.write(`[paper] skip react +1 ${token ?? "?"} from ${peer2}: size_factor ${sf} < min ${this.minSizeFactor}
+`);
+      this.emitEvent({ kind: "paper_skip", ts: new Date().toISOString(), reason: `size_factor ${sf} < min ${this.minSizeFactor}`, token: token ?? "?", peer: peer2, sf });
+      return;
+    }
     const direction = sigPayload.direction ?? "long";
     if (direction !== "long" && direction !== "short") {
       const peer2 = trigger?.from_username ?? "?";
@@ -15376,6 +15383,9 @@ function normalizeSignalPayload(raw) {
       delete out[alias];
     }
   }
+  if (typeof out.direction === "string") {
+    out.direction = out.direction.toLowerCase();
+  }
   if (out.metadata && typeof out.metadata === "object") {
     const meta2 = { ...out.metadata };
     for (const [alias, canonical] of Object.entries(META_ALIASES)) {
@@ -15402,6 +15412,17 @@ function normalizeSignalPayload(raw) {
     }
     if (Object.keys(meta2).length > 0) {
       out.metadata = meta2;
+      const movedKeys = new Set([
+        ...Object.keys(META_ALIASES),
+        "entry_price",
+        "stop_loss",
+        "take_profit",
+        "leverage",
+        "time_stop_hours",
+        "position_pct"
+      ]);
+      for (const key of movedKeys)
+        delete out[key];
     }
   }
   if (!out.token) {
@@ -15768,6 +15789,9 @@ async function runOneStream(susu, provider, log, limiter, cfg, myAddress, paperT
   }
   if (!resp.ok || !resp.body)
     throw new Error(`stream HTTP ${resp.status}`);
+  const processed = loadAlreadyProcessedIds(cfg.decision_log_path);
+  process.stderr.write(`[daemon] stream: loaded ${processed.size} already-processed event IDs
+`);
   const reader = resp.body.getReader();
   const decoder = new TextDecoder;
   let buf = "";
@@ -15804,7 +15828,18 @@ async function runOneStream(susu, provider, log, limiter, cfg, myAddress, paperT
         continue;
       if (myAddress && evt.from_address === myAddress)
         continue;
-      handleEvent(evt, susu, provider, log, limiter, cfg, paperTrader).catch((err) => {
+      const eventId = evt.signal_id ?? evt.reaction_id;
+      if (eventId && processed.has(eventId)) {
+        process.stderr.write(`[daemon] stream: skipping already-processed ${evt.kind} ${eventId.slice(0, 8)}…
+`);
+        continue;
+      }
+      handleEvent(evt, susu, provider, log, limiter, cfg, paperTrader).then(() => {
+        if (evt.signal_id)
+          processed.add(evt.signal_id);
+        if (evt.reaction_id)
+          processed.add(evt.reaction_id);
+      }).catch((err) => {
         process.stderr.write(`[daemon] handle error: ${err?.message ?? err}
 `);
       });
@@ -15868,7 +15903,15 @@ async function handleEvent(evt, susu, provider, log, limiter, cfg, paperTrader) 
   }
   await log.log({ ctx, decision, stats, result, error });
   if (paperTrader && !error) {
-    paperTrader.onDecision(decision, evt);
+    let signalPayload;
+    if (evt.kind === "reaction" && evt.signal_id && history.length > 0) {
+      const orig = history.find((h2) => h2.signal_id === evt.signal_id);
+      if (orig?.payload && typeof orig.payload === "object") {
+        const { payload: normalized } = normalizeSignalPayload(orig.payload);
+        signalPayload = normalized;
+      }
+    }
+    paperTrader.onDecision(decision, evt, signalPayload);
   }
   if (cfg.on_decision) {
     try {

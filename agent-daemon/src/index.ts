@@ -457,6 +457,10 @@ async function runOneStream(
   }
   if (!resp.ok || !resp.body) throw new Error(`stream HTTP ${resp.status}`);
 
+  // Dedup: load IDs already decided on from previous runs / reconnects.
+  const processed = loadAlreadyProcessedIds(cfg.decision_log_path);
+  process.stderr.write(`[daemon] stream: loaded ${processed.size} already-processed event IDs\n`);
+
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
@@ -487,7 +491,20 @@ async function runOneStream(
       // Daemon only acts on signal / reaction events.
       if (evt?.kind !== "signal" && evt?.kind !== "reaction") continue;
       if (myAddress && evt.from_address === myAddress) continue;
-      handleEvent(evt, susu, provider, log, limiter, cfg, paperTrader).catch((err) => {
+
+      // Dedup: skip events whose signal has already been decided on.
+      const eventId = evt.signal_id ?? evt.reaction_id;
+      if (eventId && processed.has(eventId)) {
+        process.stderr.write(`[daemon] stream: skipping already-processed ${evt.kind} ${eventId.slice(0, 8)}…\n`);
+        continue;
+      }
+
+      handleEvent(evt, susu, provider, log, limiter, cfg, paperTrader).then(() => {
+        // After successful decision, mark both IDs so subsequent
+        // reactions to the same signal are skipped.
+        if (evt.signal_id) processed.add(evt.signal_id);
+        if (evt.reaction_id) processed.add(evt.reaction_id);
+      }).catch((err) => {
         process.stderr.write(`[daemon] handle error: ${(err as Error)?.message ?? err}\n`);
       });
     }
@@ -567,8 +584,20 @@ async function handleEvent(
   await log.log({ ctx, decision, stats, result, error });
 
   // Built-in paper trading (in-process, zero overhead).
+  // When the trigger is a reaction, paper trader needs the original signal's
+  // payload (token, entry_price, sl, tp, etc.), not the reaction's payload.
   if (paperTrader && !error) {
-    paperTrader.onDecision(decision, evt);
+    let signalPayload: Record<string, unknown> | undefined;
+    if (evt.kind === "reaction" && evt.signal_id && history.length > 0) {
+      // Channel history API (/channels/{id}/signals) only returns signals
+      // (no reactions) and omits the `kind` field — match by signal_id only.
+      const orig = history.find((h: any) => h.signal_id === evt.signal_id);
+      if (orig?.payload && typeof orig.payload === "object") {
+        const { payload: normalized } = normalizeSignalPayload(orig.payload as Record<string, unknown>);
+        signalPayload = normalized;
+      }
+    }
+    paperTrader.onDecision(decision, evt, signalPayload);
   }
 
   // Optional on_decision hook for power users bridging external systems.
