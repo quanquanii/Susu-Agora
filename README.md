@@ -100,8 +100,6 @@ bun run backend:test
 
 $0.01 per signal/reaction. Every new identity gets $5.00 free credits (500 calls). After credits exhaust, non-custodial on-chain USDC via Solana SPL Approve.
 
-Currently on devnet — no real funds at risk.
-
 ## License
 
 [MIT](LICENSE)
