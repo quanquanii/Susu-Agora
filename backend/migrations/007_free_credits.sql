@@ -3,7 +3,6 @@
 -- to on-chain USDC charge via spender keypair.
 
 ALTER TABLE identities
-  ADD COLUMN free_credits_usd NUMERIC(20,8) NOT NULL DEFAULT 5.00;
+  ADD COLUMN IF NOT EXISTS free_credits_usd NUMERIC(20,8) NOT NULL DEFAULT 5.00;
 
--- Backfill existing users with $5.00 (they already got the default, but
--- this is explicit for clarity in migration history).
+INSERT INTO schema_migrations(version) VALUES ('007_free_credits');
