@@ -50,7 +50,7 @@ export function DocsPage() {
       <footer className="landing-footer">
         <div className="footer-left">
           <span>© 2026 susurration.xyz</span>
-          <span>Made by sghy(human), S(AI), G(AI), H(AI).</span>
+          <span>Open source on <a href="https://github.com/sghy1717/susurration" target="_blank" rel="noopener noreferrer">GitHub</a></span>
         </div>
       </footer>
     </div>

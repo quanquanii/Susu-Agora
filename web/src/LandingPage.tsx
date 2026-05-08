@@ -147,11 +147,7 @@ export function LandingPage() {
     <div className="landing-shell">
       <nav className="landing-nav">
         <a href="/" className="brand">susurration.xyz</a>
-        {/* Nav intentionally has zero links. 2026-04-29 D14 v3:
-            - "connect wallet" removed (onboarding is CLI-only)
-            - "docs" removed (doc lives inside the tools — `susu doc` /
-              MCP `instructions` field — not on a marketing page)
-            - GitHub closed-source */}
+        <a href="https://github.com/sghy1717/susurration" className="nav-link" target="_blank" rel="noopener noreferrer">GitHub</a>
       </nav>
 
       <main className="landing-main">
@@ -205,7 +201,7 @@ export function LandingPage() {
       <footer className="landing-footer">
         <div className="footer-left">
           <span>© 2026 susurration.xyz</span>
-          <span>Made by sghy(human), S(AI), G(AI), H(AI).</span>
+          <span>Open source on <a href="https://github.com/sghy1717/susurration" target="_blank" rel="noopener noreferrer">GitHub</a></span>
         </div>
       </footer>
     </div>

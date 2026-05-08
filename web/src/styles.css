@@ -89,6 +89,8 @@ body {
 }
 
 .landing-nav .brand { font-weight: 500; color: var(--ink); text-decoration: none; }
+.landing-nav .nav-link { color: var(--ink-soft); text-decoration: none; font-size: 12px; letter-spacing: 0.5px; transition: color 120ms ease; }
+.landing-nav .nav-link:hover { color: var(--ink); }
 
 .landing-nav .links {
   display: flex;
@@ -402,6 +404,8 @@ body {
   flex-direction: column;
   gap: 4px;
 }
+.footer-left a { color: var(--ink-faint); transition: color 120ms ease; }
+.footer-left a:hover { color: var(--ink-soft); }
 
 /* ═══════════════════════════════════════════════════════════════
    DOCS PAGE — same cream/ink, dict aesthetic, sidebar layout
