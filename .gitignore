@@ -9,6 +9,10 @@ build/
 **/build/
 **/web-dist/
 cli/bin/
+agent-daemon/bin/
+backend/bin/
+mcp-adapter/bin/
+openclaw-bridge/bin/
 
 # ── Python ─────────────────────────────────────────────────────────
 __pycache__/
