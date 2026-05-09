@@ -67,9 +67,14 @@ Billing
 Paper Trading
   susu book                                   Show paper trading positions + balance
 
+Webhook (24/7 without local daemon)
+  susu webhook set <https://url>              Set webhook URL — server POSTs signals to it
+  susu webhook get                            Show current webhook + secret
+  susu webhook clear                          Remove webhook
+
 Misc
   susu doc                                    Full agent reference (pipe to your agent)
-  susu privacy [on|off]                       Toggle the friend gate (default OFF — incoming adds queue as requests)
+  susu privacy gate [on|off]                   Toggle the friend gate (on=require approval, off=auto-accept)
   susu config                                 Show config + session info
   susu help                                   This text
 
@@ -78,7 +83,7 @@ Env: SUSU_API_URL (defaults to https://susurration.fly.dev/api), SUSU_HOME (defa
 
 type Cmd = (args: string[]) => Promise<number>;
 
-const PKG_VERSION = "0.0.22";
+const PKG_VERSION = "0.0.31";
 
 function checkForUpdate(): void {
   fetch("https://registry.npmjs.org/susurration/latest", {
@@ -100,9 +105,9 @@ async function main() {
   const rest = argv.slice(1);
 
   const dispatch: Record<string, Cmd> = {
-    help: async () => { printBanner("0.0.1"); process.stdout.write(HELP); return 0; },
-    "--help": async () => { printBanner("0.0.1"); process.stdout.write(HELP); return 0; },
-    "-h": async () => { printBanner("0.0.1"); process.stdout.write(HELP); return 0; },
+    help: async () => { printBanner(PKG_VERSION); process.stdout.write(HELP); return 0; },
+    "--help": async () => { printBanner(PKG_VERSION); process.stdout.write(HELP); return 0; },
+    "-h": async () => { printBanner(PKG_VERSION); process.stdout.write(HELP); return 0; },
     join: cmdJoin,
     init: cmdInit,
     login: cmdLogin,
@@ -127,6 +132,7 @@ async function main() {
     doc: cmdDoc,
     docs: cmdDoc, // alias — typo-tolerant
     privacy: cmdPrivacy,
+    webhook: cmdWebhook,
     config: cmdConfig,
     book: cmdBook,
     paper: cmdBook, // alias
@@ -548,9 +554,14 @@ async function cmdRegister(args: string[]): Promise<number> {
   // single-source between DOC and CLI simplifies error attribution.
   const FORMAT_RE = /^[a-z0-9_-]{5,20}$/;
   if (!FORMAT_RE.test(username)) {
+    const reason = username.length < 5
+      ? `too short (${username.length} chars, minimum 5)`
+      : username.length > 20
+        ? `too long (${username.length} chars, maximum 20)`
+        : "contains invalid characters";
     process.stderr.write(
       `invalid username "@${username}":\n` +
-      `  must be 5-20 chars, lowercase a-z 0-9 _ -\n`,
+      `  ${reason}. Allowed: lowercase a-z, 0-9, _ , -\n`,
     );
     return 1;
   }
@@ -830,8 +841,10 @@ async function cmdMeta(args: string[]): Promise<number> {
   const id = args[1];
   if (!id) { process.stderr.write("usage: susu meta [get|set|patch] <channel_id> [-j JSON]\n"); return 1; }
 
+  const channelId = await resolveTargetChannel(cfg, id);
+
   if (sub === "get") {
-    const out = await api<{ meta: any }>(cfg, `/channels/${id}/meta`);
+    const out = await api<{ meta: any }>(cfg, `/channels/${channelId}/meta`);
     return printJsonOrTable(args, out, (o) => JSON.stringify(o.meta, null, 2) + "\n");
   }
   if (sub === "set" || sub === "patch") {
@@ -843,10 +856,10 @@ async function cmdMeta(args: string[]): Promise<number> {
     try { body = JSON.parse(args[idx + 1]!); }
     catch (e) { process.stderr.write(`invalid JSON: ${(e as Error).message}\n`); return 1; }
     const method = sub === "set" ? "PUT" : "PATCH";
-    const out = await api(cfg, `/channels/${id}/meta`, {
+    const out = await api(cfg, `/channels/${channelId}/meta`, {
       method, body: JSON.stringify(body),
     });
-    return printJsonOrTable(args, out, () => `meta ${sub === "set" ? "replaced" : "merged"} for ${id}\n`);
+    return printJsonOrTable(args, out, () => `meta ${sub === "set" ? "replaced" : "merged"} for ${channelId}\n`);
   }
   process.stderr.write("usage: susu meta [get|set|patch] <channel_id> [-j JSON]\n");
   return 1;
@@ -1431,6 +1444,155 @@ function mergeTimelines(server: any[], paper: any[]): any[] {
   return combined;
 }
 
+// ────── persistent position bar (feed footer) ──────
+
+function loadOpenPaperPositions(): any[] {
+  const fs = require("node:fs") as typeof import("node:fs");
+  const tradesPath = `${configDir()}/paper_trades.json`;
+  try {
+    const data = JSON.parse(fs.readFileSync(tradesPath, "utf8"));
+    return (data.trades ?? []).filter((t: any) => t.status === "open");
+  } catch { return []; }
+}
+
+async function fetchBinancePricesForBar(symbols: string[]): Promise<Map<string, number>> {
+  const prices = new Map<string, number>();
+  if (symbols.length === 0) return prices;
+  try {
+    const resp = await fetch("https://fapi.binance.com/fapi/v1/ticker/price", {
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (!resp.ok) return prices;
+    const data = (await resp.json()) as Array<{ symbol: string; price: string }>;
+    const want = new Set(symbols);
+    for (const item of data) {
+      if (want.has(item.symbol)) prices.set(item.symbol, parseFloat(item.price));
+    }
+  } catch { /* network error — bar shows "…" for prices */ }
+  return prices;
+}
+
+/**
+ * Persistent position bar at the bottom of the feed terminal.
+ * Uses ANSI scroll regions to reserve space below the feed output.
+ * Refreshes live prices from Binance every 15 seconds.
+ *
+ * The scroll region is set **synchronously** on first call so that all
+ * subsequent feed output is constrained to the scroll region.  Price
+ * data is fetched asynchronously and back-filled on first tick.
+ *
+ * Returns a cleanup function that resets the terminal scroll region.
+ */
+function startPositionBar(): () => void {
+  if (!process.stdout.isTTY) return () => {};
+
+  let reservedLines = 0;
+  let active = true;
+
+  const calcBarLines = (nPositions: number): number =>
+    nPositions === 0 ? 0 : 1 + Math.min(nPositions, 4) + (nPositions > 4 ? 1 : 0);
+
+  const applyScrollRegion = (needed: number) => {
+    const rows = process.stdout.rows ?? 24;
+    if (needed === reservedLines) return;
+    reservedLines = needed;
+    if (needed === 0) {
+      process.stdout.write("\x1b[r"); // reset scroll region to full terminal
+    } else {
+      process.stdout.write(`\x1b[1;${rows - reservedLines}r`);
+      // Move cursor inside the scroll region so subsequent output stays there.
+      process.stdout.write(`\x1b[${rows - reservedLines};1H`);
+    }
+  };
+
+  const drawBar = (positions: any[], prices: Map<string, number>) => {
+    if (reservedLines === 0) return;
+    const rows = process.stdout.rows ?? 24;
+    const cols = process.stdout.columns ?? 80;
+    const termWidth = Math.max(40, Math.min(120, cols));
+
+    const posLines: string[] = [];
+    for (const pos of positions.slice(0, 4)) {
+      const cp = prices.get(pos.token) ?? null;
+      const sign = pos.direction === "long" ? "📈" : "📉";
+      if (cp !== null) {
+        const delta = pos.direction === "long"
+          ? (cp - pos.entry_price) / pos.entry_price
+          : (pos.entry_price - cp) / pos.entry_price;
+        const pnlPct = delta * pos.leverage * 100;
+        const pnlUsd = delta * pos.notional_usd;
+        const c = pnlPct >= 0 ? "\x1b[32m" : "\x1b[31m";
+        const pnl = `${c}${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}% ($${pnlUsd >= 0 ? "+" : ""}${pnlUsd.toFixed(2)})${RESET}`;
+        posLines.push(`  ${sign} #${pos.id} ${pos.token} ${pos.direction} ${pos.leverage}x  entry=${pos.entry_price}  now=${cp}  ${pnl}`);
+      } else {
+        posLines.push(`  ${sign} #${pos.id} ${pos.token} ${pos.direction} ${pos.leverage}x  entry=${pos.entry_price}  ${dim("loading…")}`);
+      }
+    }
+    if (positions.length > 4) {
+      posLines.push(dim(`  ... +${positions.length - 4} more`));
+    }
+
+    process.stdout.write("\x1b7"); // save cursor (DEC)
+    const separator = dim("─── positions " + "─".repeat(Math.max(0, termWidth - 15)));
+    for (let i = 0; i < reservedLines; i++) {
+      process.stdout.write(`\x1b[${rows - reservedLines + 1 + i};1H\x1b[2K`);
+      if (i === 0) process.stdout.write(separator);
+      else process.stdout.write(posLines[i - 1] ?? "");
+    }
+    process.stdout.write("\x1b8"); // restore cursor (DEC)
+  };
+
+  // ── Synchronous init: set scroll region immediately if positions exist ──
+  const initialPositions = loadOpenPaperPositions();
+  const needed = calcBarLines(initialPositions.length);
+  if (needed > 0) {
+    applyScrollRegion(needed);
+    // Draw placeholder bar (no prices yet — "loading…")
+    drawBar(initialPositions, new Map());
+  }
+
+  // ── Async refresh: fetch prices and re-draw ──
+  const redraw = async () => {
+    if (!active) return;
+
+    const positions = loadOpenPaperPositions();
+    const newNeeded = calcBarLines(positions.length);
+
+    if (newNeeded !== reservedLines) {
+      applyScrollRegion(newNeeded);
+    }
+    if (positions.length === 0) return;
+
+    const symbols = [...new Set(positions.map((p: any) => p.token))];
+    const prices = await fetchBinancePricesForBar(symbols);
+    if (!active) return; // could have been cleaned up during fetch
+
+    drawBar(positions, prices);
+  };
+
+  // First async tick fills in real prices
+  redraw();
+
+  // Refresh every 15 seconds
+  const timer = setInterval(redraw, 15_000);
+
+  // Handle terminal resize
+  const onResize = () => {
+    reservedLines = 0; // force scroll region recalculation
+    redraw();
+  };
+  process.stdout.on("resize", onResize);
+
+  return () => {
+    active = false;
+    clearInterval(timer);
+    process.stdout.removeListener("resize", onResize);
+    if (reservedLines > 0) {
+      process.stdout.write("\x1b[r"); // reset scroll region
+    }
+  };
+}
+
 async function cmdFeed(args: string[]): Promise<number> {
   const cfg = await loadConfig();
   if (!cfg.token) { process.stderr.write("not logged in (run `susu login`)\n"); return 2; }
@@ -1494,6 +1656,10 @@ async function cmdFeed(args: string[]): Promise<number> {
   }
 
   if (!follow) return 0;
+
+  // 1b. Start persistent position bar (open positions + live P&L at bottom of terminal).
+  const cleanupPositionBar = startPositionBar();
+  process.on("exit", () => cleanupPositionBar());
 
   // 2. Live tail via SSE on /signals/feed/stream + local event log for paper trading.
   if (bubbles && process.stdout.isTTY) {
@@ -1764,6 +1930,63 @@ async function cmdUsage(args: string[]): Promise<number> {
 // channel (`on`) or queue a request the user must accept (`off`).
 // Default for new accounts is `off` (per migration 006). Args:
 //   susu privacy            → show current setting + brief explanation
+// ── Webhook ─────────────────────────────────────────────────────────────
+async function cmdWebhook(args: string[]): Promise<number> {
+  const cfg = await loadConfig();
+  if (!cfg.token) { process.stderr.write("not logged in\n"); return 2; }
+  const sub = (args[0] ?? "").toLowerCase();
+
+  if (sub === "set") {
+    const url = args[1];
+    if (!url || !url.startsWith("https://")) {
+      process.stderr.write("usage: susu webhook set <https://url>\n");
+      return 1;
+    }
+    const out = await api<any>(cfg, "/identity/webhook", {
+      method: "POST", body: JSON.stringify({ url }),
+    });
+    return printJsonOrTable(args, out, (o) =>
+      `webhook set: ${o.webhook_url}\n` +
+      `secret:      ${o.webhook_secret}\n` +
+      `\nAdd this secret to your webhook handler to verify X-Susu-Signature.\n`,
+    );
+  }
+
+  if (sub === "get") {
+    const out = await api<any>(cfg, "/identity/webhook");
+    return printJsonOrTable(args, out, (o) =>
+      o.webhook_url
+        ? `url:    ${o.webhook_url}\nsecret: ${o.webhook_secret}\n`
+        : "no webhook configured\n",
+    );
+  }
+
+  if (sub === "clear" || sub === "remove" || sub === "delete") {
+    const out = await api<any>(cfg, "/identity/webhook", { method: "DELETE" });
+    return printJsonOrTable(args, out, () => "webhook cleared\n");
+  }
+
+  // No sub or unknown → show current
+  if (!sub) {
+    const out = await api<any>(cfg, "/identity/webhook");
+    if (out.webhook_url) {
+      process.stdout.write(
+        `url:    ${out.webhook_url}\nsecret: ${out.webhook_secret}\n`,
+      );
+    } else {
+      process.stdout.write(
+        "no webhook configured\n\n" +
+        "Set one to receive signals via HTTP POST (24/7 without local daemon):\n" +
+        "  susu webhook set https://your-worker.example.com/webhook\n",
+      );
+    }
+    return 0;
+  }
+
+  process.stderr.write("usage: susu webhook [set <url> | get | clear]\n");
+  return 1;
+}
+
 //   susu privacy on         → flip to auto-accept (use only for trusted circles)
 //   susu privacy off        → flip back to gate (default)
 async function cmdPrivacy(args: string[]): Promise<number> {
@@ -1784,8 +2007,25 @@ async function cmdPrivacy(args: string[]): Promise<number> {
     return 0;
   }
 
+  // `susu privacy gate on` / `susu privacy gate off` (preferred, unambiguous)
+  if (sub === "gate") {
+    const gateVal = (args[1] ?? "").toLowerCase();
+    if (gateVal !== "on" && gateVal !== "off") {
+      process.stderr.write("usage: susu privacy gate [on|off]\n  gate on  = require approval (safer, default)\n  gate off = auto-accept (trusted circles only)\n");
+      return 1;
+    }
+    const value = gateVal === "off"; // gate OFF = auto-accept ON
+    const out = await api<any>(cfg, "/identity/auto-accept", {
+      method: "POST", body: JSON.stringify({ value }),
+    });
+    return printJsonOrTable(args, out, () =>
+      `friend gate: ${gateVal.toUpperCase()} — ${value ? "auto-accept enabled" : "manual approval required"}\n`,
+    );
+  }
+
+  // Legacy: `susu privacy on/off` (kept for compat, inverted naming)
   if (sub !== "on" && sub !== "off") {
-    process.stderr.write("usage: susu privacy [on|off]\n");
+    process.stderr.write("usage: susu privacy gate [on|off]\n  gate on  = require approval (safer, default)\n  gate off = auto-accept (trusted circles only)\n");
     return 1;
   }
 
