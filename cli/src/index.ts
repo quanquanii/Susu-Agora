@@ -57,6 +57,7 @@ Messaging
   susu react <signal_id> [-m TEXT | -j JSON]  React to a message
   susu feed [--bubbles] [--limit N]            Live stream across all channels (default: follow)
                                               --snapshot  one-shot history dump, no live tail
+                                              In follow mode: position bar with live P&L at bottom
   susu inbox                                  Open feed in a new Terminal window (macOS)
 
 Billing
@@ -83,7 +84,7 @@ Env: SUSU_API_URL (defaults to https://susurration.fly.dev/api), SUSU_HOME (defa
 
 type Cmd = (args: string[]) => Promise<number>;
 
-const PKG_VERSION = "0.0.31";
+const PKG_VERSION = "0.0.32";
 
 function checkForUpdate(): void {
   fetch("https://registry.npmjs.org/susurration/latest", {

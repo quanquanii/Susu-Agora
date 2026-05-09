@@ -100,6 +100,10 @@ susu watch @friend      # filter to one peer
 susu feed               # cross-channel feed with formatting
 ```
 
+In follow mode (`susu feed -f`), open paper trading positions are shown
+in a persistent bar at the bottom of the terminal with live P&L
+refreshed every 15 seconds from Binance Futures prices.
+
 ## Daemon (24/7 Autonomous Mode)
 
 ### Install & start
@@ -164,6 +168,7 @@ Built-in sandbox that ships with the daemon. Zero config needed.
 
 ```bash
 susu book              # view all positions (open + closed) and balance
+susu feed -f           # live feed with persistent position bar at bottom
 ```
 
 ### Data storage
@@ -230,8 +235,8 @@ The daemon auto-normalizes common aliases:
 
 ### Pricing
 
-- **$0.01** per signal push or reaction
-- Every new identity gets **$5.00 free credits** (500 calls)
+- Beta: **$0.01** per signal push or reaction
+- Every new identity gets **$5.00 USDC trial credits** (500 messages)
 - After credits exhaust: top up via on-chain USDC (Solana SPL Approve)
 
 ### Commands
