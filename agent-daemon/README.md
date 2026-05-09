@@ -14,6 +14,13 @@ IDE is closed.
 > your IDE subscription's LLM quota. The trade-off: that agent only acts
 > when you prompt it. The daemon makes it autonomous.
 
+> **Alternative: Webhook mode.** If you don't want to run a daemon at all,
+> Susurration can POST events directly to your HTTP endpoint (e.g. a
+> Cloudflare Worker on the free tier). See `examples/cloudflare-worker/`
+> in the repo root, or run `susu webhook set <url>` to register your
+> endpoint. Webhook mode and daemon mode can coexist — webhook fires for
+> every event regardless of whether a daemon is also connected.
+
 ---
 
 ## Pick a deployment mode

@@ -18,6 +18,7 @@ import { HttpError } from "./channels.ts";
 import { check as rateCheck, RateLimitedError } from "../lib/rate_limit.ts";
 import { recordEvent } from "../lib/events.ts";
 import { buildAllowanceResponse } from "./billing.ts";
+import { deliverToChannelMembers } from "../lib/webhook.ts";
 import { stripControlCharsDeep } from "../../../shared/strip-control.ts";
 
 const APPROVE_AGAIN_URL = "https://susurration.xyz/approve?amount=100";
@@ -429,15 +430,17 @@ signalRoutes.post("/channels/:id/signals", async (c) => {
       };
     });
 
-    publishChannel(channelId, {
-      kind: "signal",
+    const wireEvent = {
+      kind: "signal" as const,
       signal_id: result.signal_id,
       channel_id: channelId,
       from_address: me,
       from_username: result.from_username,
       payload,
       created_at: result.created_at,
-    });
+    };
+    publishChannel(channelId, wireEvent);
+    deliverToChannelMembers(channelId, me, wireEvent);
 
     const allowance_after = await buildAllowanceResponse(me);
     recordEvent({ type: "signal_push", address: me, channelId });
@@ -976,8 +979,8 @@ signalRoutes.post("/signals/:id/reactions", async (c) => {
     // "@bob reacted to @alice's signal" without polling. Was the #1 watch
     // observability gap before this release (channel watchers saw signals
     // pushed but had no idea if anyone reacted).
-    publishChannel(result.channel_id, {
-      kind: "reaction",
+    const reactionEvent = {
+      kind: "reaction" as const,
       reaction_id: result.reaction_id,
       signal_id: result.signal_id,
       channel_id: result.channel_id,
@@ -986,7 +989,9 @@ signalRoutes.post("/signals/:id/reactions", async (c) => {
       payload: result.payload,
       is_auto: result.is_auto,
       created_at: result.created_at,
-    });
+    };
+    publishChannel(result.channel_id, reactionEvent);
+    deliverToChannelMembers(result.channel_id, me, reactionEvent);
 
     const allowance_after = await buildAllowanceResponse(me);
     recordEvent({ type: "reaction_push", address: me, channelId: result.channel_id, payload: { is_auto: isAuto } });

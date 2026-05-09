@@ -22,7 +22,8 @@ validateSolanaConfig({
   cluster: config.solanaCluster,
   rpcUrl: config.solanaRpcUrl,
   usdcMint: config.usdcMint,
-  allowOverride: config.allowMintOverride || config.allowRpcHostnameMismatch,
+  allowMintOverride: config.allowMintOverride,
+  allowRpcHostnameMismatch: config.allowRpcHostnameMismatch,
 });
 
 const app = new Hono();
@@ -124,6 +125,30 @@ app.use("/api/signals/:id/reactions", drainBody);
 // BETA-1.b: kick off the rate limiter's bucket GC so memory doesn't grow
 // unbounded. Buckets older than 5 min are pruned every 5 min.
 import("./lib/rate_limit.ts").then(({ startGc }) => startGc());
+
+// Overload protection: if event loop lag exceeds threshold, shed non-critical
+// requests with 503. SSE streams and /health are exempt.
+let eventLoopLagMs = 0;
+const LAG_THRESHOLD_MS = 500;
+const lagProbe = () => {
+  const start = performance.now();
+  setTimeout(() => {
+    eventLoopLagMs = performance.now() - start - 50;
+    lagProbe();
+  }, 50);
+};
+lagProbe();
+
+const overloadGuard: MiddlewareHandler = async (c, next) => {
+  const path = c.req.path;
+  if (path === "/health" || path.endsWith("/stream")) return next();
+  if (eventLoopLagMs > LAG_THRESHOLD_MS) {
+    c.header("Retry-After", "5");
+    return c.json({ error: "server_busy", message: "system is under heavy load, please retry in a few seconds", retry_after_sec: 5 }, 503);
+  }
+  return next();
+};
+app.use("/api/*", overloadGuard);
 app.use(
   "*",
   cors({

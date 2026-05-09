@@ -321,7 +321,8 @@ export function validateSolanaConfig(args: {
   cluster: string;
   rpcUrl: string;
   usdcMint: string;
-  allowOverride?: boolean;
+  allowMintOverride?: boolean;
+  allowRpcHostnameMismatch?: boolean;
 }): void {
   const known = KNOWN_MINTS[args.cluster];
   if (!known) {
@@ -330,35 +331,26 @@ export function validateSolanaConfig(args: {
       `Set SOLANA_CLUSTER explicitly.`,
     );
   }
-  // Override path: SUSU_USDC_MINT was explicitly set to something other than
-  // the canonical mint. Allow only if SUSU_ALLOW_MINT_OVERRIDE=1 (e.g. local
-  // mock USDC mint in tests).
   if (args.usdcMint !== known.mint) {
-    if (!args.allowOverride) {
+    if (!args.allowMintOverride) {
       throw new ClusterMismatchError(
         `SUSU_USDC_MINT=${args.usdcMint} but cluster=${args.cluster} expects ${known.mint}. ` +
         `If this is intentional (local mock USDC), set SUSU_ALLOW_MINT_OVERRIDE=1.`,
       );
     }
   }
-  // RPC URL sanity — does it mention the cluster name? Prevents the classic
-  // "mainnet RPC + devnet mint" silent misconfig that loses real funds.
   const rpcLower = args.rpcUrl.toLowerCase();
   const rpcLooksRight = known.rpc_substring.some((s) => rpcLower.includes(s));
-  // Allow private/internal RPC URLs (helius, quicknode etc) by checking the
-  // host doesn't contain *the wrong* cluster keyword either.
   const otherClusters = Object.keys(KNOWN_MINTS).filter((c) => c !== args.cluster);
   const rpcLooksWrong = otherClusters.some((other) =>
     KNOWN_MINTS[other]!.rpc_substring.some((s) => rpcLower.includes(s)),
   );
-  if (rpcLooksWrong) {
+  if (rpcLooksWrong && !args.allowRpcHostnameMismatch) {
     throw new ClusterMismatchError(
       `SOLANA_RPC_URL=${args.rpcUrl} looks like a different cluster than SOLANA_CLUSTER=${args.cluster}. ` +
       `If this is intentional (private RPC endpoint), rename the host or set SUSU_ALLOW_RPC_HOSTNAME_MISMATCH=1.`,
     );
   }
-  // We log a soft warning if rpc doesn't *look* right but doesn't *look* wrong
-  // either (e.g. "https://my-rpc.example.com"). This is fine — don't fail.
   void rpcLooksRight;
 }
 

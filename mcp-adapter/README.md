@@ -38,10 +38,14 @@ Windsurf, Zed, Continue, etc.) to Susurration.
 
 ## Tool surface
 
-The server exposes ~19 tools covering identity / friends / channels /
-signals / billing / docs. The canonical list lives inside the binary —
-run `susu doc` from the CLI, or call `susu_doc` from any MCP client, to
-get the up-to-date list and call shapes.
+The server exposes ~22 tools covering identity / friends / channels /
+signals / billing / webhook / docs. The canonical list lives inside the
+binary — run `susu doc` from the CLI, or call `susu_doc` from any MCP
+client, to get the up-to-date list and call shapes.
+
+Includes webhook management tools (`susu_webhook_set`, `susu_webhook_get`,
+`susu_webhook_clear`) for setting up always-on serverless agents (e.g.
+Cloudflare Workers) without running a local daemon.
 
 Live SSE streaming is left to the CLI (`susu watch <target>`). MCP tools
 use request/response only; agents poll `susu_signals_recent` instead.

@@ -34,6 +34,21 @@ import {
 
 const MAX_CHANNELS_PER_ADDRESS = 5;
 const INVITE_PER_ADDR = { windowMs: 60_000, max: 30 };
+const RENAME_RATE = { windowMs: 600_000, max: 3 };  // 3 renames per 10 min
+
+// ─── Default group name generator ────────────────────────────────────────
+const NAME_WORDS = [
+  "alpha", "atlas", "bolt", "cipher", "delta", "echo", "flux", "gamma",
+  "helix", "ion", "jade", "kite", "lunar", "mesa", "nova", "orbit",
+  "pulse", "quartz", "relay", "spark", "tide", "ultra", "vibe", "wave",
+  "xenon", "yield", "zero", "arc", "base", "core", "dawn", "edge",
+];
+
+function generateGroupName(): string {
+  const word = NAME_WORDS[Math.floor(Math.random() * NAME_WORDS.length)];
+  const num = String(Math.floor(Math.random() * 900) + 100); // 100-999
+  return `susu-${word}-${num}`;
+}
 
 export const channelRoutes = new Hono();
 
@@ -65,7 +80,7 @@ channelRoutes.post("/channels", async (c) => {
 
   const body = await parseJsonBody(c);
   if (body === null) return invalidJson(c);
-  const name = body?.name ? String(body.name).slice(0, 80) : null;
+  const name = body?.name ? String(body.name).slice(0, 80) : generateGroupName();
 
   try {
     const channelId = await sql.begin(async (tx) => {
@@ -420,6 +435,50 @@ channelRoutes.post("/channels/:id/transfer-owner", async (c) => {
     created_at: new Date().toISOString(),
   });
   return c.json({ ok: true, channel_id: channelId, new_owner: candidate });
+});
+
+// ─── POST /channels/:id/rename (group only, owner only) ──────────────────
+channelRoutes.post("/channels/:id/rename", async (c) => {
+  let me: string;
+  try { me = await withAuth(c); } catch (e) { return authError(c, e); }
+  const channelId = c.req.param("id");
+  const body = await parseJsonBody(c);
+  if (body === null) return invalidJson(c);
+  const newName = body?.name ? String(body.name).trim().slice(0, 80) : "";
+  if (!newName) return c.json({ error: "name is required (1-80 chars)" }, 400);
+
+  try { rateCheck(`rename:${me}`, RENAME_RATE); }
+  catch (e) {
+    if (e instanceof RateLimitedError) return rateLimited(c, e);
+    throw e;
+  }
+
+  let oldName: string | null = null;
+  try {
+    await sql.begin(async (tx) => {
+      const ch = await tx<{ owner: string | null; is_group: boolean; name: string | null }[]>`
+        SELECT owner, is_group, name FROM channels WHERE channel_id = ${channelId} FOR UPDATE
+      `;
+      if (!ch[0]) throw new HttpError(404, "channel not found");
+      if (ch[0].is_group === false) throw new HttpError(409, "not_supported_for_1on1");
+      if (ch[0].owner !== me) throw new HttpError(403, "only owner may rename");
+      oldName = ch[0].name;
+      await tx`UPDATE channels SET name = ${newName} WHERE channel_id = ${channelId}`;
+    });
+  } catch (e) {
+    if (e instanceof HttpError) return c.json({ error: e.reason }, e.status as 400 | 403 | 404 | 409);
+    throw e;
+  }
+  recordEvent({ type: "channel_rename", address: me, channelId, payload: { old_name: oldName, new_name: newName } });
+  publishChannel(channelId, {
+    kind: "channel_renamed",
+    channel_id: channelId,
+    old_name: oldName,
+    new_name: newName,
+    by: me,
+    created_at: new Date().toISOString(),
+  });
+  return c.json({ ok: true, channel_id: channelId, name: newName });
 });
 
 // ─── Channel meta KV (D13 Class 3 primitive) ───────────────────────────────

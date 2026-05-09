@@ -7,6 +7,7 @@ import {
 import { parseJsonBody, invalidJson } from "../lib/http.ts";
 import { check as rateCheck, RateLimitedError } from "../lib/rate_limit.ts";
 import { recordEvent } from "../lib/events.ts";
+import { generateWebhookSecret } from "../lib/webhook.ts";
 
 export const identityRoutes = new Hono();
 
@@ -14,6 +15,8 @@ export const identityRoutes = new Hono();
 // Tighter than business endpoints because /auth/nonce is the open registration door.
 const NONCE_PER_ADDR = { windowMs: 60_000, max: 10 };
 const NONCE_PER_IP = { windowMs: 60_000, max: 30 };
+const REGISTER_PER_IP = { windowMs: 60_000, max: 5 };
+const VERIFY_PER_IP = { windowMs: 60_000, max: 10 };
 
 function clientIp(c: any): string {
   // Trust Fly's edge-set header in prod; fall back to nothing in dev.
@@ -43,6 +46,7 @@ identityRoutes.post("/auth/verify", async (c) => {
   const body = await parseJsonBody(c);
   if (body === null) return invalidJson(c);
   try {
+    rateCheck(`verify:ip:${clientIp(c)}`, VERIFY_PER_IP);
     const out = await verifySignatureAndIssueSession({
       address: String(body?.address ?? ""),
       nonce: String(body?.nonce ?? ""),
@@ -51,6 +55,10 @@ identityRoutes.post("/auth/verify", async (c) => {
     });
     return c.json(out);
   } catch (e) {
+    if (e instanceof RateLimitedError) {
+      c.header("Retry-After", String(e.retryAfterSec));
+      return c.json({ error: "rate_limited", retry_after_sec: e.retryAfterSec }, 429);
+    }
     if (e instanceof AuthError) return c.json({ error: e.reason }, e.status as 400 | 401 | 409);
     throw e;
   }
@@ -94,6 +102,15 @@ const USERNAME_RE_SELF_SERVE = /^[a-z0-9_-]{5,20}$/;
 const USERNAME_RE_DB_LIMIT = /^[a-z0-9_-]{3,20}$/;  // hard floor (matches DB CHECK)
 
 identityRoutes.post("/identity/register", async (c) => {
+  try {
+    rateCheck(`register:ip:${clientIp(c)}`, REGISTER_PER_IP);
+  } catch (e) {
+    if (e instanceof RateLimitedError) {
+      c.header("Retry-After", String(e.retryAfterSec));
+      return c.json({ error: "rate_limited", retry_after_sec: e.retryAfterSec }, 429);
+    }
+    throw e;
+  }
   let me: string;
   try {
     me = await authedAddress(c.req.header("authorization"));
@@ -213,4 +230,80 @@ identityRoutes.post("/identity/auto-accept", async (c) => {
   const value = Boolean(body?.value ?? body?.on);
   await sql`UPDATE identities SET auto_accept_friends = ${value} WHERE address = ${me}`;
   return c.json({ ok: true, auto_accept_friends: value });
+});
+
+// ── Webhook management ─────────────────────────────────────────────────
+// POST /identity/webhook  body: {url: string}
+// Set a webhook URL. Server POSTs signal/reaction events to this URL.
+// Generates a shared secret for HMAC signature verification.
+identityRoutes.post("/identity/webhook", async (c) => {
+  let me: string;
+  try {
+    me = await authedAddress(c.req.header("authorization"));
+  } catch (e) {
+    if (e instanceof AuthError) return c.json({ error: e.reason }, e.status as 400 | 401);
+    throw e;
+  }
+  const body = await parseJsonBody(c);
+  if (body === null) return invalidJson(c);
+  const url = body?.url;
+  if (typeof url !== "string" || !url.startsWith("https://")) {
+    return c.json({ error: "webhook_url must be an https:// URL" }, 400);
+  }
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    if (
+      host === "localhost" ||
+      host.endsWith(".local") ||
+      host.endsWith(".internal") ||
+      /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|0\.|169\.254\.)/.test(host) ||
+      host === "[::1]"
+    ) {
+      return c.json({ error: "webhook_url must not point to a private/internal address" }, 400);
+    }
+  } catch {
+    return c.json({ error: "webhook_url is not a valid URL" }, 400);
+  }
+  const secret = generateWebhookSecret();
+  await sql`
+    UPDATE identities SET webhook_url = ${url}, webhook_secret = ${secret}
+    WHERE address = ${me}
+  `;
+  return c.json({ ok: true, webhook_url: url, webhook_secret: secret });
+});
+
+// GET /identity/webhook
+identityRoutes.get("/identity/webhook", async (c) => {
+  let me: string;
+  try {
+    me = await authedAddress(c.req.header("authorization"));
+  } catch (e) {
+    if (e instanceof AuthError) return c.json({ error: e.reason }, e.status as 400 | 401);
+    throw e;
+  }
+  const rows = await sql<{ webhook_url: string | null; webhook_secret: string | null }[]>`
+    SELECT webhook_url, webhook_secret FROM identities WHERE address = ${me}
+  `;
+  const row = rows[0];
+  return c.json({
+    webhook_url: row?.webhook_url ?? null,
+    webhook_secret: row?.webhook_secret ?? null,
+  });
+});
+
+// DELETE /identity/webhook
+identityRoutes.delete("/identity/webhook", async (c) => {
+  let me: string;
+  try {
+    me = await authedAddress(c.req.header("authorization"));
+  } catch (e) {
+    if (e instanceof AuthError) return c.json({ error: e.reason }, e.status as 400 | 401);
+    throw e;
+  }
+  await sql`
+    UPDATE identities SET webhook_url = NULL, webhook_secret = NULL
+    WHERE address = ${me}
+  `;
+  return c.json({ ok: true });
 });

@@ -27,21 +27,16 @@ primary_region = "sin"
   # per new identity (migration 007). Set to "0" to revert to free BETA.
   BILLING_RATE_USD = "0.01"
 
-  # Cluster / chain config. BETA stays on devnet (no real USDC at risk).
-  # Paid-mode flip → set both of these to mainnet values in the same deploy.
-  SOLANA_CLUSTER = "devnet"
-  SOLANA_RPC_URL = "https://api.devnet.solana.com"
-  # USDC mint defaults to devnet's automatically (config.ts), but we pin
-  # explicitly so a misconfigured cluster never silently uses the wrong mint.
-  SUSU_USDC_MINT = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
+  # Cluster / chain config. Production runs on mainnet-beta with real USDC.
+  SOLANA_CLUSTER = "mainnet-beta"
+  SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
+  # Circle USDC on Solana mainnet. Pinned explicitly so a misconfigured
+  # cluster never silently uses the wrong mint.
+  SUSU_USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
   # Spender (hot-wallet) keypair path. Lives on the persistent volume
-  # mounted at /data so a machine restart keeps the same delegate. First
-  # request to /billing/spender on devnet auto-generates the file (rate=0
-  # means it's never actually used to sign txs during BETA, but persisting
-  # it lets paid-mode flip happen with no migration of stored grants).
-  # Paid-mode mainnet: REPLACE this file via `fly ssh sftp` with a real
-  # production keypair before flipping cluster.
+  # mounted at /data so a machine restart keeps the same delegate.
+  # Production keypair uploaded via `fly ssh sftp`.
   SUSU_HOT_WALLET_KEYPAIR = "/data/susu/hot-wallet.json"
 
   # CORS — only susurration.xyz needs to call the API in prod.

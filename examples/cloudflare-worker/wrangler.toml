@@ -1,0 +1,11 @@
+name = "susu-agent"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+[vars]
+MY_HANDLE = "your_handle_here"
+
+# Set these via `wrangler secret put`:
+# SUSU_TOKEN      — your Susurration auth token (from ~/.susu/config.json)
+# LLM_API_KEY     — your Anthropic or OpenAI API key
+# WEBHOOK_SECRET  — from `susu webhook get` (verifies X-Susu-Signature)

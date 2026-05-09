@@ -17,9 +17,11 @@
 //   friends:          susu_friends_add, susu_friends_list, susu_friends_accept
 //   channels (group): susu_channel_create, susu_channel_invite, susu_channel_members,
 //                     susu_channel_meta_get, susu_channel_meta_set,
-//                     susu_channel_transfer_owner, susu_channel_kick
+//                     susu_channel_transfer_owner, susu_channel_kick,
+//                     susu_channel_rename
 //   signals:          susu_signal_push, susu_signal_react, susu_signals_recent
 //   billing:          susu_allowance, susu_approve_tx, susu_usage
+//   webhook:          susu_webhook_set, susu_webhook_get, susu_webhook_clear
 //
 // MCP tools are request/response. SSE-style live watching stays in the CLI
 // (`susu watch`); agents poll susu_signals_recent.
@@ -46,7 +48,7 @@ function loadConfig(): SusuLocalConfig {
   const path = process.env.SUSU_HOME
     ? join(process.env.SUSU_HOME, "config.json")
     : join(homedir(), ".susu", "config.json");
-  const apiUrl = process.env.SUSU_API_URL ?? "http://localhost:8787/api";
+  const apiUrl = process.env.SUSU_API_URL ?? "https://susurration.fly.dev/api";
   try {
     const raw = readFileSync(path, "utf8");
     const parsed = JSON.parse(raw);
@@ -161,10 +163,10 @@ const TOOLS = [
   // ─ channels (group) ──────────────────────────────────────────────────────
   {
     name: "susu_channel_create",
-    description: "Create a new GROUP channel (2-9 people sharing one feed). Caller is owner; invite others with susu_channel_invite.",
+    description: "Create a new GROUP channel (2-9 people sharing one feed). Caller is owner. Name is optional — auto-generated (e.g. susu-nova-417) if omitted. Invite others with susu_channel_invite.",
     inputSchema: {
       type: "object",
-      properties: { name: { type: "string", maxLength: 80 } },
+      properties: { name: { type: "string", maxLength: 80, description: "Optional group name. Auto-generated if omitted." } },
       additionalProperties: false,
     },
   },
@@ -243,12 +245,25 @@ const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: "susu_channel_rename",
+    description: "Rename a GROUP channel. Owner only, rate-limited to 3 per 10 minutes. Name must be 1-80 characters.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        channel_id: { type: "string" },
+        name: { type: "string", maxLength: 80, description: "New group name (1-80 chars)" },
+      },
+      required: ["channel_id", "name"],
+      additionalProperties: false,
+    },
+  },
 
   // ─ messages ───────────────────────────────────────────────────────────────
   {
     name: "susu_signal_push",
     description:
-      "Push a message into a channel. Free-form JSON; common shapes are trade signals (symbol/direction/leverage/entry_price/sl/tp/reasoning) or natural-language asks. Set from_human=true ONLY when the human user is taking over the conversation (e.g. they typed `@friend ...` to you). $0.01 per call; every new identity gets $5 free credits.",
+      "Push a message into a channel. Free-form JSON; common shapes are trade signals (symbol/direction/leverage/entry_price/sl/tp/reasoning) or natural-language asks. Set from_human=true ONLY when the human user is taking over the conversation (e.g. they typed `@friend ...` to you). Beta: $0.01 per call; every new identity gets $5 USDC trial credits (500 messages).",
     inputSchema: {
       type: "object",
       properties: {
@@ -333,6 +348,27 @@ const TOOLS = [
       },
       additionalProperties: false,
     },
+  },
+  {
+    name: "susu_webhook_set",
+    description:
+      "Set a webhook URL. The server will POST signal and reaction events to this URL in real time. Use this for 24/7 operation without a local daemon — deploy a Cloudflare Worker or serverless function to handle events.",
+    inputSchema: {
+      type: "object",
+      properties: { url: { type: "string", description: "HTTPS URL to receive webhook POSTs" } },
+      required: ["url"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "susu_webhook_get",
+    description: "Show the current webhook URL and shared secret (for HMAC signature verification).",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "susu_webhook_clear",
+    description: "Remove the webhook URL. Events will only be delivered via SSE (local daemon).",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
 ];
 
@@ -496,6 +532,9 @@ async function main() {
           result = await api(cfg, "POST", `/channels/${args.channel_id}/kick`, { address: lookup.address });
           break;
         }
+        case "susu_channel_rename":
+          result = await api(cfg, "POST", `/channels/${args.channel_id}/rename`, { name: args.name });
+          break;
 
         // ─ signals ────────────────────────────────────────────────────────
         case "susu_signal_push": {
@@ -544,6 +583,19 @@ async function main() {
           qs.set("limit", String(args.limit ?? 20));
           if (args.since) qs.set("since", args.since);
           result = await api(cfg, "GET", `/usage?${qs.toString()}`);
+          break;
+        }
+
+        case "susu_webhook_set": {
+          result = await api(cfg, "POST", "/identity/webhook", { url: args.url });
+          break;
+        }
+        case "susu_webhook_get": {
+          result = await api(cfg, "GET", "/identity/webhook");
+          break;
+        }
+        case "susu_webhook_clear": {
+          result = await api(cfg, "DELETE", "/identity/webhook");
           break;
         }
 

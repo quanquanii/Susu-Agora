@@ -37,7 +37,9 @@ Friends
   susu friends remove @handle                 Remove a friend
 
 Groups (2-9 people sharing one channel)
-  susu group create <name> @h1 @h2 ...        Create a group; owner = you
+  susu group create [name] @h1 @h2 ...        Create a group; owner = you
+                                              Name is optional; auto-generated if omitted
+  susu group rename <channel_id> <new name>   Rename a group (owner only, 3/10min)
   susu group members <channel_id>             List members
   susu group invite <channel_id> @handle      Invite a friend
   susu group leave <channel_id>               Leave; ownership auto-passes to next member
@@ -84,7 +86,7 @@ Env: SUSU_API_URL (defaults to https://susurration.fly.dev/api), SUSU_HOME (defa
 
 type Cmd = (args: string[]) => Promise<number>;
 
-const PKG_VERSION = "0.0.32";
+const PKG_VERSION = "0.0.33";
 
 function checkForUpdate(): void {
   fetch("https://registry.npmjs.org/susurration/latest", {
@@ -829,7 +831,17 @@ async function cmdGroup(args: string[]): Promise<number> {
     return printJsonOrTable(rest, out, (o) => `new owner of ${o.channel_id}: ${o.new_owner.slice(0, 6)}…\n`);
   }
 
-  process.stderr.write("usage: susu group [create|members|invite|leave|kick|transfer-owner] ...\n");
+  if (sub === "rename") {
+    const id = rest[0];
+    const newName = rest.slice(1).join(" ");
+    if (!id || !newName) { process.stderr.write("usage: susu group rename <channel_id> <new name>\n"); return 1; }
+    const out = await api<any>(cfg, `/channels/${id}/rename`, {
+      method: "POST", body: JSON.stringify({ name: newName }),
+    });
+    return printJsonOrTable(rest, out, (o) => `renamed → "${o.name}"\n`);
+  }
+
+  process.stderr.write("usage: susu group [create|members|invite|leave|kick|rename|transfer-owner] ...\n");
   return 1;
 }
 
@@ -1322,6 +1334,8 @@ function renderWireEvent(e: any): string | null {
       return `${t}  ${dim(`[meta ${e.method}]`)}         by ${w(e.by, null)}${e.size_bytes ? ` (${e.size_bytes}B)` : ""}`;
     case "channel_owner_transferred":
       return `${t}  ${dim("[owner →]")}           ${w(e.from_address, null)} → ${w(e.to_address, null)} (${e.reason})`;
+    case "channel_renamed":
+      return `${t}  ${dim("[renamed]")}           "${e.old_name ?? "?"}" → "${e.new_name}" by ${w(e.by, null)}`;
     case "friend_request":
       return `${t}  ${dim("[friend req]")}        from ${w(e.from_address, e.from_username)} (req ${short(e.request_id)})`;
     case "friend_accepted":

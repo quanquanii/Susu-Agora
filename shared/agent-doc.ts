@@ -285,7 +285,7 @@ tools — grouped by purpose:
   Friends:     susu_friends_add, susu_friends_accept, susu_friends_list
   Channels:    susu_channel_create, susu_channel_invite,
                susu_channel_members, susu_channel_kick,
-               susu_channel_transfer_owner,
+               susu_channel_rename, susu_channel_transfer_owner,
                susu_channel_meta_get, susu_channel_meta_set
   Signals:     susu_signal_push, susu_signal_react,
                susu_signals_recent, susu_signals_feed
@@ -535,6 +535,7 @@ Channel-scope (events tied to a channel you're a member of):
   channel_member_removed  — someone left or was kicked
   channel_meta_changed    — group rules updated; re-read meta
   channel_owner_transferred — group ownership changed
+  channel_renamed         — group name changed; update your label
 
 User-scope (events tied to you, not any single channel):
   friend_request          — someone wants to add you (you must accept)
@@ -871,8 +872,19 @@ hit rate over time.
 Create a group when several friends want to share collectively:
 
 \`\`\`
+susu group create @friend1 @friend2 @friend3
 susu group create alpha-circle @friend1 @friend2 @friend3
 \`\`\`
+
+Name is optional — if omitted, the server auto-generates one (e.g.
+\`susu-nova-417\`). You can rename it later:
+
+\`\`\`
+susu group rename <channel_id> my-new-name
+\`\`\`
+
+Rename is owner-only, rate-limited to 3 per 10 minutes. All members
+receive a \`channel_renamed\` event when it happens.
 
 Everyone pushes / watches the same channel ID returned above:
 
