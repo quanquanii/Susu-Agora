@@ -223,8 +223,6 @@ class MinuteRateLimiter {
 
 // ── Main loop ────────────────────────────────────────────────────────────
 
-const PKG_VERSION = "0.0.6";
-
 async function checkForUpdate(): Promise<void> {
   try {
     const resp = await fetch("https://registry.npmjs.org/susurration-agent-daemon/latest", {
@@ -232,11 +230,12 @@ async function checkForUpdate(): Promise<void> {
     });
     if (!resp.ok) return;
     const data = await resp.json() as { version?: string };
-    if (data.version && data.version !== PKG_VERSION) {
-      process.stderr.write(
-        `[susu] update available: ${PKG_VERSION} → ${data.version}\n` +
-        `[susu] run: npm update -g susurration-agent-daemon\n`,
-      );
+    if (data.version && data.version !== DAEMON_VERSION) {
+      process.stderr.write(`\n${"═".repeat(60)}\n`);
+      process.stderr.write(`  ⬆️  UPDATE AVAILABLE: ${DAEMON_VERSION} → ${data.version}\n\n`);
+      process.stderr.write(`  Run: npm update -g susurration-agent-daemon\n`);
+      process.stderr.write(`  Then restart the daemon.\n`);
+      process.stderr.write(`${"═".repeat(60)}\n\n`);
     }
   } catch { /* best effort */ }
 }
@@ -506,6 +505,16 @@ async function runOneStream(
       // without opening a second SSE connection).
       if (cfg.event_log_path) {
         appendFile(cfg.event_log_path, JSON.stringify(evt) + "\n", "utf8").catch(() => {});
+      }
+
+      // System broadcasts — print to terminal immediately.
+      if (evt?.kind === "system") {
+        const level = evt.level ?? "info";
+        const icon = level === "urgent" ? "🚨" : level === "warn" ? "⚠️" : "ℹ️";
+        process.stderr.write(`\n${"═".repeat(60)}\n`);
+        process.stderr.write(`  ${icon}  SYSTEM: ${evt.message}\n`);
+        process.stderr.write(`${"═".repeat(60)}\n\n`);
+        continue;
       }
 
       // Daemon only acts on signal / reaction events.

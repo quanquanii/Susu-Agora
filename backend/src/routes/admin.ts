@@ -12,6 +12,7 @@ import { sql } from "../db.ts";
 import { config } from "../config.ts";
 import { parseJsonBody, invalidJson } from "../lib/http.ts";
 import { isValidSolanaAddress } from "../auth.ts";
+import { publishAll, sseStats, type SystemEvent } from "./signals.ts";
 
 export const adminRoutes = new Hono();
 
@@ -423,4 +424,29 @@ adminRoutes.post("/admin/usernames/:username/grant", async (c) => {
     throw e;
   }
   return c.json({ ok: true, username, locked_to: address });
+});
+
+// ─── System broadcast ───────────────────────────────────────────────────
+// POST /admin/broadcast  body: {message, level?}
+// Pushes a system event to ALL connected SSE subscribers.
+adminRoutes.post("/admin/broadcast", async (c) => {
+  const g = adminGuard(c);
+  if ("error" in g) return g.error;
+
+  const body = await parseJsonBody(c);
+  if (body === null) return invalidJson(c);
+  const message = String(body?.message ?? "").trim();
+  if (!message) return c.json({ error: "message required" }, 400);
+  const level = (body?.level === "warn" || body?.level === "urgent") ? body.level : "info";
+
+  const evt: SystemEvent = {
+    kind: "system",
+    message,
+    level: level as "info" | "warn" | "urgent",
+    created_at: new Date().toISOString(),
+  };
+
+  const stats = sseStats();
+  publishAll(evt);
+  return c.json({ ok: true, delivered_to_subscribers: stats.subscribers, level });
 });

@@ -197,6 +197,13 @@ export type ChannelCreatedEvent = {
   created_at: string;
 };
 
+export type SystemEvent = {
+  kind: "system";
+  message: string;
+  level: "info" | "warn" | "urgent";
+  created_at: string;
+};
+
 export type Event =
   | SignalEvent
   | ReactionEvent
@@ -208,7 +215,8 @@ export type Event =
   | FriendAcceptedEvent
   | FriendRemovedEvent
   | ChannelInvitedEvent
-  | ChannelCreatedEvent;
+  | ChannelCreatedEvent
+  | SystemEvent;
 
 // Sentinel pushed via the same fn() to signal "you've been ejected from the
 // channel, abort the SSE stream now". Distinguished from real events by the
@@ -251,6 +259,20 @@ export function publishChannel(channelId: string, evt: Event) {
  *  registers a `user:<addr>` subscription on connect. */
 export function publishUser(address: string, evt: Event) {
   publish(`user:${address}`, evt);
+}
+
+/** Broadcast to ALL live SSE subscribers across all channels and users.
+ *  Used for system-wide announcements (version updates, maintenance, etc). */
+export function publishAll(evt: Event) {
+  const seen = new Set<Subscriber["fn"]>();
+  for (const subs of subscribers.values()) {
+    for (const s of subs) {
+      // Dedup: a user subscribed to multiple channels gets one copy.
+      if (seen.has(s.fn)) continue;
+      seen.add(s.fn);
+      try { s.fn(evt); } catch { /* never let one slow consumer break others */ }
+    }
+  }
 }
 
 function subscribe(
