@@ -16,6 +16,7 @@ export const identityRoutes = new Hono();
 const NONCE_PER_ADDR = { windowMs: 60_000, max: 10 };
 const NONCE_PER_IP = { windowMs: 60_000, max: 30 };
 const REGISTER_PER_IP = { windowMs: 60_000, max: 5 };
+const REGISTER_DAILY_PER_IP = 3;  // max registrations per IP per 24h (DB-backed, survives restart)
 const VERIFY_PER_IP = { windowMs: 60_000, max: 10 };
 
 function clientIp(c: any): string {
@@ -102,14 +103,23 @@ const USERNAME_RE_SELF_SERVE = /^[a-z0-9_-]{5,20}$/;
 const USERNAME_RE_DB_LIMIT = /^[a-z0-9_-]{3,20}$/;  // hard floor (matches DB CHECK)
 
 identityRoutes.post("/identity/register", async (c) => {
+  const ip = clientIp(c);
   try {
-    rateCheck(`register:ip:${clientIp(c)}`, REGISTER_PER_IP);
+    rateCheck(`register:ip:${ip}`, REGISTER_PER_IP);
   } catch (e) {
     if (e instanceof RateLimitedError) {
       c.header("Retry-After", String(e.retryAfterSec));
       return c.json({ error: "rate_limited", retry_after_sec: e.retryAfterSec }, 429);
     }
     throw e;
+  }
+  // DB-backed 24h per-IP cap (survives restarts, unlike in-memory rate limit).
+  const [ipCount] = await sql<{ c: number }[]>`
+    SELECT count(*)::int AS c FROM register_ips
+    WHERE ip = ${ip} AND created_at > now() - interval '24 hours'
+  `;
+  if ((ipCount?.c ?? 0) >= REGISTER_DAILY_PER_IP) {
+    return c.json({ error: "ip_register_limit", message: "too many registrations from this IP today", retry_after_sec: 3600 }, 429);
   }
   let me: string;
   try {
@@ -126,6 +136,7 @@ identityRoutes.post("/identity/register", async (c) => {
 
   // Format check — reject anything outside the DB-level limit immediately.
   if (!USERNAME_RE_DB_LIMIT.test(username)) {
+    recordEvent({ type: "register_failed", address: me, payload: { reason: "invalid_username", username } });
     return c.json({
       error: "invalid_username",
       message: "username must be 3-20 chars, lowercase a-z 0-9 _ -",
@@ -137,6 +148,7 @@ identityRoutes.post("/identity/register", async (c) => {
     SELECT username FROM identities WHERE address = ${me}
   `;
   if (existing[0]?.username) {
+    recordEvent({ type: "register_failed", address: me, payload: { reason: "already_locked" } });
     return c.json({ error: "username_already_locked", current: existing[0].username }, 409);
   }
 
@@ -151,6 +163,7 @@ identityRoutes.post("/identity/register", async (c) => {
     const r = reserved[0];
     const grantedToMe = r.granted_to === me;
     if (!grantedToMe || r.category !== "rare") {
+      recordEvent({ type: "register_failed", address: me, payload: { reason: "reserved", username, category: r.category } });
       return c.json({
         error: "username_reserved",
         category: r.category,
@@ -163,6 +176,7 @@ identityRoutes.post("/identity/register", async (c) => {
     // 3-4 char names are implicitly "rare" — only reachable via admin grant
     // (which writes to identities.username directly, bypassing this route).
     if (!USERNAME_RE_SELF_SERVE.test(username)) {
+      recordEvent({ type: "register_failed", address: me, payload: { reason: "reserved", username, category: "rare" } });
       return c.json({
         error: "username_reserved",
         category: "rare",
@@ -179,15 +193,14 @@ identityRoutes.post("/identity/register", async (c) => {
     `;
   } catch (e: any) {
     if (e.code === "23505") {
+      recordEvent({ type: "register_failed", address: me, payload: { reason: "taken", username } });
       return c.json({ error: "username_taken", username }, 409);
     }
     throw e;
   }
 
-  // BETA telemetry: register is the second funnel stage. Don't include the
-  // username in the payload — it's PII (the whole point of `events` is to
-  // be join-able by hashed address but not reverse-resolvable).
-  recordEvent({ type: "register", address: me });
+  recordEvent({ type: "register", address: me, payload: { username } });
+  void sql`INSERT INTO register_ips(ip, address) VALUES (${ip}, ${me})`.catch(() => {});
 
   return c.json({ address: me, username });
 });

@@ -8,7 +8,7 @@
 //   - exit codes: 0 ok, 1 user error / network error, 2 unauthenticated
 
 import { loadConfig, saveConfig, CONFIG_PATH, configDir } from "./config.ts";
-import { api, ApiError } from "./api.ts";
+import { api, ApiError, reportClientError } from "./api.ts";
 import { generateWallet, importWallet, signMessage } from "./wallet.ts";
 import { printBanner } from "./banner.ts";
 // Single source of truth — see code/shared/agent-doc.ts. Bun bundles this in
@@ -86,7 +86,7 @@ Env: SUSU_API_URL (defaults to https://susurration.fly.dev/api), SUSU_HOME (defa
 
 type Cmd = (args: string[]) => Promise<number>;
 
-const PKG_VERSION = "0.0.33";
+const PKG_VERSION = "0.0.35";
 
 function checkForUpdate(): void {
   fetch("https://registry.npmjs.org/susurration/latest", {
@@ -150,11 +150,15 @@ async function main() {
   try {
     return await handler(rest);
   } catch (e) {
+    const errCfg = await loadConfig().catch(() => null);
     if (e instanceof ApiError) {
       process.stderr.write(`error: ${e.message}\n`);
+      if (errCfg) reportClientError(errCfg, `api_${e.status}`, e.message, { path: e.path });
       return e.status === 401 ? 2 : 1;
     }
-    process.stderr.write(`error: ${(e as Error).message}\n`);
+    const msg = (e as Error).message;
+    process.stderr.write(`error: ${msg}\n`);
+    if (errCfg) reportClientError(errCfg, "cli_error", msg, { command: cmd });
     return 1;
   }
 }

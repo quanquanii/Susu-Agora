@@ -66,8 +66,14 @@ friendRoutes.post("/friends/add", async (c) => {
   if (body === null) return invalidJson(c);
   const targetInput = String(body?.username ?? body?.address ?? "");
   const target = await resolveTarget(targetInput);
-  if (!target) return c.json({ error: "user_not_found", input: targetInput }, 404);
-  if (target.address === me) return c.json({ error: "cannot_add_self" }, 400);
+  if (!target) {
+    recordEvent({ type: "friend_add_failed", address: me, payload: { reason: "user_not_found", input: targetInput } });
+    return c.json({ error: "user_not_found", input: targetInput }, 404);
+  }
+  if (target.address === me) {
+    recordEvent({ type: "friend_add_failed", address: me, payload: { reason: "cannot_add_self" } });
+    return c.json({ error: "cannot_add_self" }, 400);
+  }
 
   const { a, b } = orderPair(me, target.address);
 

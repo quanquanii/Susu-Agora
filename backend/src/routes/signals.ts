@@ -444,6 +444,7 @@ signalRoutes.post("/channels/:id/signals", async (c) => {
 
     const allowance_after = await buildAllowanceResponse(me);
     recordEvent({ type: "signal_push", address: me, channelId });
+    void sql`UPDATE identities SET last_active_at = now() WHERE address = ${me}`.catch(() => {});
     return c.json({ ...result, allowance_after }, 201);
   } catch (e) {
     if (e instanceof InsufficientAllowanceError) {
@@ -995,6 +996,7 @@ signalRoutes.post("/signals/:id/reactions", async (c) => {
 
     const allowance_after = await buildAllowanceResponse(me);
     recordEvent({ type: "reaction_push", address: me, channelId: result.channel_id, payload: { is_auto: isAuto } });
+    void sql`UPDATE identities SET last_active_at = now() WHERE address = ${me}`.catch(() => {});
     return c.json({ ...result, allowance_after }, 201);
   } catch (e) {
     if (e instanceof InsufficientAllowanceError) {

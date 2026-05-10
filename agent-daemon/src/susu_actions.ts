@@ -3,6 +3,11 @@
 // the same action functions are reusable when we add CLI commands like
 // `susu agent-daemon dry-run`.
 
+// Bun bundles this at build time — resolved from package.json, no runtime env needed.
+// @ts-ignore — Bun resolves JSON imports at bundle time
+import pkg from "../package.json";
+const DAEMON_VERSION: string = pkg.version ?? "unknown";
+
 export interface SusuClientConfig {
   api_url: string;
   token: string;
@@ -85,6 +90,25 @@ export async function whoami(cfg: SusuClientConfig): Promise<{ address: string; 
   const resp = await authedFetch(cfg, `/me`);
   if (!resp.ok) throw new Error(`whoami HTTP ${resp.status}: ${await resp.text()}`);
   return await resp.json() as any;
+}
+
+export function reportClientError(
+  cfg: SusuClientConfig,
+  errorType: string,
+  message: string,
+  context?: Record<string, string>,
+): void {
+  const version = DAEMON_VERSION;
+  void authedFetch(cfg, `/client-errors`, {
+    method: "POST",
+    body: JSON.stringify({
+      source: "daemon",
+      version,
+      error_type: errorType,
+      message: message.slice(0, 500),
+      context,
+    }),
+  }).catch(() => {});
 }
 
 /** Cross-channel poll: returns events newer than `since` across every

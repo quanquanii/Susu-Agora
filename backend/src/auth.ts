@@ -103,7 +103,9 @@ export async function verifySignatureAndIssueSession(args: {
     await tx`
       INSERT INTO identities(address, handle)
       VALUES (${address}, ${handle})
-      ON CONFLICT (address) DO UPDATE SET handle = COALESCE(EXCLUDED.handle, identities.handle)
+      ON CONFLICT (address) DO UPDATE SET
+        handle = COALESCE(EXCLUDED.handle, identities.handle),
+        last_active_at = now()
     `;
 
     await tx`

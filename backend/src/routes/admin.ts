@@ -50,16 +50,37 @@ adminRoutes.get("/admin/events", async (c) => {
 });
 
 // GET /admin/funnel — register → first push %; basic launch-day metric
+// ?exclude_test=false to include test accounts (default: excluded).
+// Test accounts: usernames matching 0xwizard0%, s-tester, funneltest,
+// hazeprod, ga_%, gb_%, gpub_% (internal test prefixes).
+const TEST_USERNAME_PATTERNS = [
+  "0xwizard0__",   // 0xwizard001-010
+  "s-tester", "funneltest", "hazeprod",
+];
+async function testAddressHashes(): Promise<string[]> {
+  const { hashAddress } = await import("../lib/events.ts");
+  const rows = await sql<{ address: string }[]>`
+    SELECT address FROM identities
+    WHERE username LIKE '0xwizard0%'
+       OR username IN ('s-tester', 'funneltest', 'hazeprod')
+       OR username LIKE 'ga\\_%' OR username LIKE 'gb\\_%' OR username LIKE 'gpub\\_%'
+  `;
+  return rows.map(r => hashAddress(r.address));
+}
+
 adminRoutes.get("/admin/funnel", async (c) => {
   const g = adminGuard(c);
   if ("error" in g) return g.error;
 
-  // count distinct hashed addresses that did each step.
+  const excludeTest = c.req.query("exclude_test") !== "false";
+  const excludeHashes = excludeTest ? await testAddressHashes() : [];
+
   const rows = await sql<{ event_type: string; users: number }[]>`
     SELECT event_type, count(DISTINCT address_hash)::int AS users
     FROM events
     WHERE address_hash IS NOT NULL
       AND event_type IN ('auth_signin', 'register', 'friend_add_accepted', 'channel_create', 'signal_push', 'reaction_push', 'approve_signed')
+      ${excludeHashes.length > 0 ? sql`AND address_hash NOT IN ${sql(excludeHashes)}` : sql``}
     GROUP BY event_type
   `;
   const counts: Record<string, number> = {};
@@ -70,6 +91,8 @@ adminRoutes.get("/admin/funnel", async (c) => {
     rate_register_over_signin: auth_signin > 0 ? (counts["register"] ?? 0) / auth_signin : null,
     rate_first_push_over_register: (counts["register"] ?? 0) > 0
       ? (counts["signal_push"] ?? 0) / (counts["register"] ?? 1) : null,
+    test_excluded: excludeTest,
+    test_accounts_filtered: excludeHashes.length,
   });
 });
 
@@ -116,6 +139,122 @@ adminRoutes.get("/admin/retention", async (c) => {
     FROM first_signin fs LEFT JOIN activity a USING (address_hash)
   `;
   return c.json({ retention: rows });
+});
+
+// GET /admin/errors?since=ISO&window_hours=24
+adminRoutes.get("/admin/errors", async (c) => {
+  const g = adminGuard(c);
+  if ("error" in g) return g.error;
+
+  const since = c.req.query("since");
+  const windowHours = Number(c.req.query("window_hours") ?? 24);
+  if (Number.isNaN(windowHours)) return c.json({ error: "invalid window_hours" }, 400);
+
+  const rows = await sql<{ event_type: string; reason: string | null; count: number; latest: string }[]>`
+    SELECT event_type,
+           payload->>'reason' AS reason,
+           count(*)::int AS count,
+           max(created_at)::text AS latest
+    FROM events
+    WHERE event_type IN ('error', 'charge_failed', 'register_failed', 'friend_add_failed', 'client_error')
+      AND created_at > ${since ?? sql`now() - ${windowHours + ' hours'}::interval`}
+    GROUP BY event_type, payload->>'reason'
+    ORDER BY count DESC
+  `;
+  const total = rows.reduce((s, r) => s + r.count, 0);
+  return c.json({ errors: rows, total, window_hours: windowHours });
+});
+
+// GET /admin/user-journey?address_hash=&username=
+adminRoutes.get("/admin/user-journey", async (c) => {
+  const g = adminGuard(c);
+  if ("error" in g) return g.error;
+
+  let addressHash = c.req.query("address_hash");
+  const username = c.req.query("username");
+
+  if (!addressHash && username) {
+    const { hashAddress } = await import("../lib/events.ts");
+    const userRow = await sql<{ address: string }[]>`
+      SELECT address FROM identities WHERE username = ${username}
+    `;
+    if (!userRow[0]) return c.json({ error: "user_not_found" }, 404);
+    addressHash = hashAddress(userRow[0].address);
+  }
+  if (!addressHash) return c.json({ error: "provide address_hash or username" }, 400);
+
+  const events = await sql<any[]>`
+    SELECT event_id, event_type, channel_id, payload, created_at
+    FROM events
+    WHERE address_hash = ${addressHash}
+    ORDER BY created_at ASC LIMIT 500
+  `;
+  const stages = events.map(e => e.event_type);
+  const uniqueStages = [...new Set(stages)];
+  return c.json({ address_hash: addressHash, events, stages_reached: uniqueStages, total: events.length });
+});
+
+// GET /admin/users — list registered users with their funnel progress
+adminRoutes.get("/admin/users", async (c) => {
+  const g = adminGuard(c);
+  if ("error" in g) return g.error;
+
+  const since = c.req.query("since");
+  const limit = Math.min(Math.max(Number(c.req.query("limit") ?? 100), 1), 500);
+
+  const rows = await sql<any[]>`
+    SELECT i.username, i.auto_accept_friends, i.created_at, i.last_active_at,
+           i.webhook_url IS NOT NULL AS has_webhook,
+           (SELECT count(*)::int FROM friend_links fl WHERE fl.a = i.address OR fl.b = i.address) AS friend_count,
+           (SELECT count(*)::int FROM usage_log ul WHERE ul.address = i.address) AS push_count
+    FROM identities i
+    WHERE i.username IS NOT NULL
+      ${since ? sql`AND i.created_at >= ${since}` : sql``}
+    ORDER BY i.created_at DESC
+    LIMIT ${limit}
+  `;
+  return c.json({ users: rows, count: rows.length });
+});
+
+// ─── Handle reclaim (180-day inactivity) ──────────────────────────────
+// GET /admin/stale-handles?days=180 — list handles inactive for N+ days
+adminRoutes.get("/admin/stale-handles", async (c) => {
+  const g = adminGuard(c);
+  if ("error" in g) return g.error;
+
+  const days = Math.max(Number(c.req.query("days") ?? 180), 1);
+  if (Number.isNaN(days)) return c.json({ error: "invalid days" }, 400);
+
+  const rows = await sql<{ username: string; last_active_at: string; created_at: string; friend_count: number; push_count: number }[]>`
+    SELECT i.username, i.last_active_at::text, i.created_at::text,
+           (SELECT count(*)::int FROM friend_links fl WHERE fl.a = i.address OR fl.b = i.address) AS friend_count,
+           (SELECT count(*)::int FROM usage_log ul WHERE ul.address = i.address) AS push_count
+    FROM identities i
+    WHERE i.username IS NOT NULL
+      AND i.last_active_at < now() - ${days + ' days'}::interval
+    ORDER BY i.last_active_at ASC
+  `;
+  return c.json({ stale: rows, count: rows.length, threshold_days: days });
+});
+
+// POST /admin/reclaim-handle  body: {username}
+// Clears the username from the identity row, making it available again.
+adminRoutes.post("/admin/reclaim-handle", async (c) => {
+  const g = adminGuard(c);
+  if ("error" in g) return g.error;
+
+  const body = await parseJsonBody(c);
+  if (body === null) return invalidJson(c);
+  const username = String(body?.username ?? "").trim().toLowerCase().replace(/^@/, "");
+  if (!username) return c.json({ error: "username required" }, 400);
+
+  const rows = await sql<{ address: string; last_active_at: Date }[]>`
+    SELECT address, last_active_at FROM identities WHERE username = ${username}
+  `;
+  if (!rows[0]) return c.json({ error: "username_not_found" }, 404);
+
+  await sql`UPDATE identities SET username = NULL WHERE username = ${username}`;
+  return c.json({ ok: true, reclaimed: username, previous_owner_last_active: rows[0].last_active_at });
 });
 
 // ─── Reserved-username management ───────────────────────────────────────

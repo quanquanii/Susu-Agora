@@ -2,10 +2,38 @@
 
 import type { CliConfig } from "./config.ts";
 
+// Bun bundles this at build time — resolved from package.json, no runtime env needed.
+// @ts-ignore — Bun resolves JSON imports at bundle time
+import pkg from "../package.json";
+const CLI_VERSION: string = pkg.version ?? "unknown";
+
 export class ApiError extends Error {
   constructor(public status: number, public body: any, public path: string) {
     super(`HTTP ${status} ${path}: ${typeof body === "object" ? JSON.stringify(body) : body}`);
   }
+}
+
+export function reportClientError(
+  cfg: CliConfig,
+  errorType: string,
+  message: string,
+  context?: Record<string, string>,
+): void {
+  const url = cfg.api_url.replace(/\/$/, "") + "/client-errors";
+  void fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(cfg.token ? { authorization: `Bearer ${cfg.token}` } : {}),
+    },
+    body: JSON.stringify({
+      source: "cli",
+      version: CLI_VERSION,
+      error_type: errorType,
+      message: message.slice(0, 500),
+      context,
+    }),
+  }).catch(() => {});
 }
 
 export async function api<T = any>(

@@ -44,6 +44,7 @@ import { PaperTrader } from "./paper_trading.ts";
 import { normalizeSignalPayload } from "./normalize.ts";
 import {
   pushSignal, pushReaction, recentSignals, feedSince,
+  reportClientError,
   type SusuClientConfig,
 } from "./susu_actions.ts";
 
@@ -321,7 +322,9 @@ async function main(): Promise<number> {
       await runOneStream(susu, provider, log, limiter, cfg, myAddress, paperTrader, abortCtl.signal);
     } catch (err) {
       if (stopped) break;
-      process.stderr.write(`[daemon] stream error: ${(err as Error)?.message ?? err}\n`);
+      const msg = (err as Error)?.message ?? String(err);
+      process.stderr.write(`[daemon] stream error: ${msg}\n`);
+      reportClientError(susu, "stream_error", msg);
     }
     if (stopped) break;
     const elapsed = Date.now() - startedAt;
@@ -557,7 +560,9 @@ async function handleEvent(
     decision = out.decision;
     stats = out.stats;
   } catch (err) {
-    process.stderr.write(`[daemon] LLM error: ${(err as Error)?.message ?? err}\n`);
+    const msg = (err as Error)?.message ?? String(err);
+    process.stderr.write(`[daemon] LLM error: ${msg}\n`);
+    reportClientError(susu, "llm_error", msg, { provider: cfg.llm.provider ?? "unknown" });
     return;
   }
 

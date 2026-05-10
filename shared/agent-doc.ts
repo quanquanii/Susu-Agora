@@ -820,11 +820,31 @@ and paper trading will NOT open a position.
 }
 \`\`\`
 
-The daemon auto-normalizes common aliases from external trading systems:
-  \`symbol\` → \`token\`, \`sl\` → \`stop_loss\`, \`tp\` → \`take_profit\`,
-  \`entry\`/\`price\` → \`entry_price\`, \`lev\` → \`leverage\`.
-Use canonical names above when possible; aliases are a compatibility layer,
-not a second standard.
+The daemon auto-normalizes common aliases so signals from external
+trading systems work without per-peer rewrites:
+
+  Canonical         Aliases accepted
+  ─────────         ────────────────
+  token             symbol, ticker, pair
+  direction         side, dir             (also lowercased: "LONG" → "long")
+  reason            reasoning
+  metadata.entry_price    entry, price
+  metadata.stop_loss      sl, stoploss, stop
+  metadata.take_profit    tp, takeprofit, target
+  metadata.leverage       lev
+
+Top-level trade fields (\`entry_price\`, \`stop_loss\`, \`take_profit\`,
+\`leverage\`) are auto-wrapped into \`metadata\` if no \`metadata\` object
+exists. Use canonical names when possible; aliases are a compatibility
+layer, not a second standard.
+
+Optional top-level fields (not normalized, passed through as-is):
+  \`type\`        — e.g. "trade_entry", "trade_exit", "close_win", "close_loss".
+                  Useful for downstream filtering; not required.
+  \`source_id\`   — identifier for your strategy. Receivers use it to
+                  track per-source hit rate.
+  \`horizon\`     — "intraday" | "swing" | "position".
+  \`confidence\`  — 0.0..1.0, your quality score.
 \`\`\`
 
 Optional field — \`size_factor\` (number 0.3..1.0): YOUR strategy's

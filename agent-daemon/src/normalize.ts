@@ -15,6 +15,7 @@ const TOP_ALIASES: Record<string, string> = {
   pair: "token",
   side: "direction",
   dir: "direction",
+  reasoning: "reason",
 };
 
 const META_ALIASES: Record<string, string> = {

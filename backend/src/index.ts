@@ -13,6 +13,7 @@ import { channelRoutes } from "./routes/channels.ts";
 import { signalRoutes } from "./routes/signals.ts";
 import { billingRoutes } from "./routes/billing.ts";
 import { friendRoutes } from "./routes/friends.ts";
+import { clientErrorRoutes } from "./routes/client_errors.ts";
 import { adminRoutes } from "./routes/admin.ts";
 import { validateSolanaConfig } from "./lib/solana.ts";
 
@@ -86,7 +87,9 @@ app.use("/api/identity/register", bodyLimit({ maxSize: DEFAULT_BODY_MAX, onError
 app.use("/api/billing/approve-tx", bodyLimit({ maxSize: DEFAULT_BODY_MAX, onError: onTooLarge }));
 app.use("/api/admin/usernames", bodyLimit({ maxSize: DEFAULT_BODY_MAX, onError: onTooLarge }));
 app.use("/api/admin/usernames/:username/grant", bodyLimit({ maxSize: DEFAULT_BODY_MAX, onError: onTooLarge }));
+app.use("/api/admin/reclaim-handle", bodyLimit({ maxSize: DEFAULT_BODY_MAX, onError: onTooLarge }));
 app.use("/api/identity/auto-accept", bodyLimit({ maxSize: DEFAULT_BODY_MAX, onError: onTooLarge }));
+app.use("/api/client-errors", bodyLimit({ maxSize: DEFAULT_BODY_MAX, onError: onTooLarge }));
 
 // G3-R-1 fix v2: drain the body to a Buffer BEFORE the route handler runs.
 // Why: when chunked Transfer-Encoding overflows bodyLimit's stream wrapper,
@@ -210,6 +213,7 @@ api.route("/", friendRoutes);
 api.route("/", channelRoutes);
 api.route("/", signalRoutes);
 api.route("/", billingRoutes);
+api.route("/", clientErrorRoutes);
 // Admin routes registered BEFORE the catch-all so /api/admin/* doesn't 404.
 api.route("/", adminRoutes);
 // G7 P0 #1 follow-up: any unmatched /api/* must return JSON 404, NOT fall
@@ -229,8 +233,10 @@ const POST_ONLY_API_PATTERNS: RegExp[] = [
   /^\/channels\/[^/]+\/(invite|leave|kick|transfer-owner|signals)$/,
   /^\/signals\/[^/]+\/reactions$/,
   /^\/billing\/approve-tx$/,
+  /^\/client-errors$/,
   /^\/admin\/usernames$/,
   /^\/admin\/usernames\/[^/]+\/grant$/,
+  /^\/admin\/reclaim-handle$/,
 ];
 api.all("*", (c) => {
   if (c.req.method !== "POST") {

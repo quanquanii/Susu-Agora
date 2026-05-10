@@ -22,14 +22,17 @@ import { config } from "../config.ts";
 export type EventType =
   | "auth_signin"
   | "register"
+  | "register_failed"
   | "friend_add_request"
   | "friend_add_accepted"
+  | "friend_add_failed"
   | "friend_remove"
   | "channel_create"
   | "channel_invite"
   | "channel_kick"
   | "channel_leave"
   | "channel_meta_update"
+  | "channel_rename"
   | "owner_auto_elected"
   | "transfer_owner"
   | "signal_push"
@@ -37,6 +40,7 @@ export type EventType =
   | "approve_signed"
   | "charge_attempted"
   | "charge_failed"
+  | "client_error"
   | "error";
 
 export interface RecordEventArgs {
