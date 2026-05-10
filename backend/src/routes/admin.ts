@@ -7,6 +7,7 @@
 
 import { Hono } from "hono";
 import type { Context } from "hono";
+import { timingSafeEqual } from "node:crypto";
 import { sql } from "../db.ts";
 import { config } from "../config.ts";
 import { parseJsonBody, invalidJson } from "../lib/http.ts";
@@ -20,7 +21,10 @@ function adminGuard(c: Context): { ok: true } | { error: any } {
   }
   const auth = c.req.header("authorization") ?? "";
   const token = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length).trim() : "";
-  if (token !== config.adminToken) {
+  // Constant-time comparison to prevent timing side-channel attacks.
+  const expected = Buffer.from(config.adminToken);
+  const received = Buffer.from(token);
+  if (expected.length !== received.length || !timingSafeEqual(expected, received)) {
     return { error: c.json({ error: "admin_unauthorized" }, 401) };
   }
   return { ok: true };

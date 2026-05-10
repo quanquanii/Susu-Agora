@@ -549,16 +549,32 @@ channelRoutes.patch("/channels/:id/meta", async (c) => {
     return c.json({ error: "patch body must be a JSON object" }, 400);
   }
 
-  const result = await sql.begin(async (tx) => {
-    const guard = await metaWriteGuard(tx, channelId, me);
-    if ("error" in guard) return guard;
-    // jsonb shallow merge: existing || patch
-    await tx`
-      UPDATE channels SET meta = meta || ${tx.json(body as any)}
-      WHERE channel_id = ${channelId}
-    `;
-    return { ok: true as const };
-  });
+  let result: { ok: true } | { error: { body: any; status: number } };
+  try {
+    result = await sql.begin(async (tx) => {
+      const guard = await metaWriteGuard(tx, channelId, me);
+      if ("error" in guard) return guard;
+      // jsonb shallow merge: existing || patch
+      await tx`
+        UPDATE channels SET meta = meta || ${tx.json(body as any)}
+        WHERE channel_id = ${channelId}
+      `;
+      // Check merged size — same 16KB cap as PUT to prevent unbounded growth.
+      // Throw inside tx to rollback the oversized merge automatically.
+      const [row] = await tx<{ size: number }[]>`
+        SELECT octet_length(meta::text)::int AS size FROM channels WHERE channel_id = ${channelId}
+      `;
+      if ((row?.size ?? 0) > 16 * 1024) {
+        throw new Error("__META_TOO_LARGE__");
+      }
+      return { ok: true as const };
+    });
+  } catch (err) {
+    if ((err as Error).message === "__META_TOO_LARGE__") {
+      return c.json({ error: "meta too large after merge (max 16KB)" }, 413);
+    }
+    throw err;
+  }
   if ("error" in result) return c.json(result.error.body, result.error.status as 403 | 404 | 409);
   recordEvent({ type: "channel_meta_update", address: me, channelId, payload: { method: "PATCH" } });
   publishChannel(channelId, {
