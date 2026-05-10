@@ -155,15 +155,18 @@ adminRoutes.get("/admin/errors", async (c) => {
   const windowHours = Number(c.req.query("window_hours") ?? 24);
   if (Number.isNaN(windowHours)) return c.json({ error: "invalid window_hours" }, 400);
 
+  // client_error rows store the failure category in payload.error_type
+  // (not payload.reason like register_failed / friend_add_failed / charge_failed).
+  // Coalesce so the admin endpoint surfaces both shapes.
   const rows = await sql<{ event_type: string; reason: string | null; count: number; latest: string }[]>`
     SELECT event_type,
-           payload->>'reason' AS reason,
+           COALESCE(payload->>'reason', payload->>'error_type') AS reason,
            count(*)::int AS count,
            max(created_at)::text AS latest
     FROM events
     WHERE event_type IN ('error', 'charge_failed', 'register_failed', 'friend_add_failed', 'client_error')
       AND created_at > ${since ?? sql`now() - ${windowHours + ' hours'}::interval`}
-    GROUP BY event_type, payload->>'reason'
+    GROUP BY event_type, COALESCE(payload->>'reason', payload->>'error_type')
     ORDER BY count DESC
   `;
   const total = rows.reduce((s, r) => s + r.count, 0);
