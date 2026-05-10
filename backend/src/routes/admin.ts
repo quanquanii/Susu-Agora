@@ -429,6 +429,28 @@ adminRoutes.post("/admin/usernames/:username/grant", async (c) => {
   return c.json({ ok: true, username, locked_to: address });
 });
 
+// ─── Admin set auto_accept for a user ─────────────────────────────────────
+// POST /admin/auto-accept  body: {handle: "@name", value: boolean}
+// Lets admin toggle auto_accept_friends for any user (e.g. demo accounts).
+adminRoutes.post("/admin/auto-accept", async (c) => {
+  const g = adminGuard(c);
+  if ("error" in g) return g.error;
+
+  const body = await parseJsonBody(c);
+  if (body === null) return invalidJson(c);
+  const handle = String(body?.handle ?? "").replace(/^@/, "").trim();
+  if (!handle) return c.json({ error: "handle required" }, 400);
+  const value = Boolean(body?.value ?? true);
+
+  const [row] = await sql<{ address: string }[]>`
+    SELECT address FROM identities WHERE handle = ${handle} OR username = ${handle}
+  `;
+  if (!row) return c.json({ error: "user_not_found", handle }, 404);
+
+  await sql`UPDATE identities SET auto_accept_friends = ${value} WHERE address = ${row.address}`;
+  return c.json({ ok: true, handle, auto_accept_friends: value });
+});
+
 // ─── System broadcast ───────────────────────────────────────────────────
 // POST /admin/broadcast  body: {message, level?}
 // Pushes a system event to ALL connected SSE subscribers.

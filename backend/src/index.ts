@@ -89,6 +89,7 @@ app.use("/api/admin/usernames", bodyLimit({ maxSize: DEFAULT_BODY_MAX, onError: 
 app.use("/api/admin/usernames/:username/grant", bodyLimit({ maxSize: DEFAULT_BODY_MAX, onError: onTooLarge }));
 app.use("/api/admin/reclaim-handle", bodyLimit({ maxSize: DEFAULT_BODY_MAX, onError: onTooLarge }));
 app.use("/api/admin/broadcast", bodyLimit({ maxSize: DEFAULT_BODY_MAX, onError: onTooLarge }));
+app.use("/api/admin/auto-accept", bodyLimit({ maxSize: DEFAULT_BODY_MAX, onError: onTooLarge }));
 app.use("/api/identity/auto-accept", bodyLimit({ maxSize: DEFAULT_BODY_MAX, onError: onTooLarge }));
 app.use("/api/client-errors", bodyLimit({ maxSize: DEFAULT_BODY_MAX, onError: onTooLarge }));
 
@@ -239,6 +240,7 @@ const POST_ONLY_API_PATTERNS: RegExp[] = [
   /^\/admin\/usernames\/[^/]+\/grant$/,
   /^\/admin\/reclaim-handle$/,
   /^\/admin\/broadcast$/,
+  /^\/admin\/auto-accept$/,
 ];
 api.all("*", (c) => {
   if (c.req.method !== "POST") {
