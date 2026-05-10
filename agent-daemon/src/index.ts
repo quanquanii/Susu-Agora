@@ -437,6 +437,23 @@ async function runOncePoll(
   return 0;
 }
 
+// ── LLM auth error tracking ─────────────────────────────────────────────
+// Shared across handleEvent calls within a stream session. When the user's
+// LLM API key is wrong, every event triggers a 401 — we detect the pattern
+// and pause with a loud banner instead of silently burning through errors.
+const LLM_AUTH_PAUSE_THRESHOLD = 3;
+const LLM_AUTH_PAUSE_SECONDS = 300;  // 5 min cooldown between retries
+let llmAuthErrorCount = 0;
+let llmAuthPausedUntil = 0;
+
+function isLlmAuthError(msg: string): boolean {
+  return /\b(401|403|Incorrect API key|invalid.*api.?key|authentication|unauthorized)\b/i.test(msg);
+}
+
+function isLlmQuotaError(msg: string): boolean {
+  return /\b(429|quota|rate.?limit|exceeded.*quota|billing)\b/i.test(msg);
+}
+
 async function runOneStream(
   susu: SusuClientConfig,
   provider: LLMProvider,
@@ -553,16 +570,50 @@ async function handleEvent(
     my_handle: null,  // filled by main(); could thread through but UI shows from_username already
   };
 
+  // ── LLM auth error cooldown ──────────────────────────────────────────
+  if (llmAuthPausedUntil > Date.now()) {
+    // Silently skip — banner already printed, waiting for cooldown.
+    return;
+  }
+
   let decision: AgentDecision;
   let stats;
   try {
     const out = await provider.decide(ctx, cfg.agent.system_prompt);
     decision = out.decision;
     stats = out.stats;
+    // Success → reset auth error counter.
+    if (llmAuthErrorCount > 0) {
+      process.stderr.write(`[daemon] ✅ LLM recovered after ${llmAuthErrorCount} auth errors\n`);
+      llmAuthErrorCount = 0;
+    }
   } catch (err) {
     const msg = (err as Error)?.message ?? String(err);
     process.stderr.write(`[daemon] LLM error: ${msg}\n`);
     reportClientError(susu, "llm_error", msg, { provider: cfg.llm.provider ?? "unknown" });
+
+    if (isLlmAuthError(msg)) {
+      llmAuthErrorCount++;
+      if (llmAuthErrorCount >= LLM_AUTH_PAUSE_THRESHOLD) {
+        process.stderr.write(`\n${"═".repeat(60)}\n`);
+        process.stderr.write(`  ❌ LLM API KEY ERROR — ${llmAuthErrorCount} consecutive failures\n\n`);
+        process.stderr.write(`  Your LLM API key is invalid or expired.\n`);
+        process.stderr.write(`  Daemon will pause LLM calls for ${LLM_AUTH_PAUSE_SECONDS / 60} minutes.\n\n`);
+        process.stderr.write(`  To fix:\n`);
+        process.stderr.write(`    1. Check your API key at your LLM provider's dashboard\n`);
+        process.stderr.write(`    2. Update ~/.susu/agent-config.json → llm.api_key\n`);
+        process.stderr.write(`    3. Restart the daemon\n`);
+        process.stderr.write(`${"═".repeat(60)}\n\n`);
+        llmAuthPausedUntil = Date.now() + LLM_AUTH_PAUSE_SECONDS * 1000;
+      }
+    } else if (isLlmQuotaError(msg)) {
+      process.stderr.write(`\n${"═".repeat(60)}\n`);
+      process.stderr.write(`  ⚠️  LLM QUOTA EXCEEDED\n\n`);
+      process.stderr.write(`  Your LLM API quota is exhausted. Check your billing at\n`);
+      process.stderr.write(`  your provider's dashboard. Daemon will retry in ${LLM_AUTH_PAUSE_SECONDS / 60} min.\n`);
+      process.stderr.write(`${"═".repeat(60)}\n\n`);
+      llmAuthPausedUntil = Date.now() + LLM_AUTH_PAUSE_SECONDS * 1000;
+    }
     return;
   }
 
