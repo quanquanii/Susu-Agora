@@ -80,13 +80,17 @@ Misc
   susu privacy gate [on|off]                   Toggle the friend gate (on=require approval, off=auto-accept)
   susu config                                 Show config + session info
   susu help                                   This text
+  susu --version                               Print CLI version
 
 Env: SUSU_API_URL (defaults to https://susurration.fly.dev/api), SUSU_HOME (default ~/.susu)
 `;
 
 type Cmd = (args: string[]) => Promise<number>;
 
-const PKG_VERSION = "0.0.35";
+// Bun bundles this at build time — resolved from package.json, no runtime env needed.
+// @ts-ignore — Bun resolves JSON imports at bundle time
+import pkg from "../package.json";
+const PKG_VERSION: string = pkg.version ?? "unknown";
 
 function checkForUpdate(): void {
   fetch("https://registry.npmjs.org/susurration/latest", {
@@ -111,6 +115,9 @@ async function main() {
     help: async () => { printBanner(PKG_VERSION); process.stdout.write(HELP); return 0; },
     "--help": async () => { printBanner(PKG_VERSION); process.stdout.write(HELP); return 0; },
     "-h": async () => { printBanner(PKG_VERSION); process.stdout.write(HELP); return 0; },
+    "--version": async () => { process.stdout.write(`${PKG_VERSION}\n`); return 0; },
+    "-v": async () => { process.stdout.write(`${PKG_VERSION}\n`); return 0; },
+    version: async () => { process.stdout.write(`${PKG_VERSION}\n`); return 0; },
     join: cmdJoin,
     init: cmdInit,
     login: cmdLogin,
@@ -228,7 +235,7 @@ function promptLine(question: string): Promise<string> {
 }
 
 async function cmdJoin(args: string[]): Promise<number> {
-  const FORMAT_RE = /^[a-z0-9_-]{5,20}$/;
+  const FORMAT_RE = /^[a-z0-9][a-z0-9_-]{4,19}$/;
   let raw = args[0];
   let llmKey = pickFlag(args, "--llm-key");
   let noPaper = args.includes("--no-paper");
@@ -559,13 +566,15 @@ async function cmdRegister(args: string[]): Promise<number> {
   // (admin endpoint), so a recipient never needs to call `register` for
   // those — they appear as already-set on next `whoami`. Keeping this rule
   // single-source between DOC and CLI simplifies error attribution.
-  const FORMAT_RE = /^[a-z0-9_-]{5,20}$/;
+  const FORMAT_RE = /^[a-z0-9][a-z0-9_-]{4,19}$/;
   if (!FORMAT_RE.test(username)) {
-    const reason = username.length < 5
-      ? `too short (${username.length} chars, minimum 5)`
-      : username.length > 20
-        ? `too long (${username.length} chars, maximum 20)`
-        : "contains invalid characters";
+    const reason = username.startsWith("-")
+      ? "cannot start with '-' (looks like a CLI flag)"
+      : username.length < 5
+        ? `too short (${username.length} chars, minimum 5)`
+        : username.length > 20
+          ? `too long (${username.length} chars, maximum 20)`
+          : "contains invalid characters";
     process.stderr.write(
       `invalid username "@${username}":\n` +
       `  ${reason}. Allowed: lowercase a-z, 0-9, _ , -\n`,

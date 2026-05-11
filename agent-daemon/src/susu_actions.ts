@@ -6,6 +6,7 @@
 // Bun bundles this at build time — resolved from package.json, no runtime env needed.
 // @ts-ignore — Bun resolves JSON imports at bundle time
 import pkg from "../package.json";
+import { redactSecrets, redactSecretsDeep } from "../../shared/redact.ts";
 const DAEMON_VERSION: string = pkg.version ?? "unknown";
 
 export interface SusuClientConfig {
@@ -105,8 +106,8 @@ export function reportClientError(
       source: "daemon",
       version,
       error_type: errorType,
-      message: message.slice(0, 500),
-      context,
+      message: redactSecrets(message).slice(0, 500),
+      context: context ? redactSecretsDeep(context) : context,
     }),
   }).catch(() => {});
 }

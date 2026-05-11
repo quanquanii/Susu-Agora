@@ -1,6 +1,7 @@
 // Thin wrapper around fetch — adds auth header, surfaces server error bodies.
 
 import type { CliConfig } from "./config.ts";
+import { redactSecrets, redactSecretsDeep } from "../../shared/redact.ts";
 
 // Bun bundles this at build time — resolved from package.json, no runtime env needed.
 // @ts-ignore — Bun resolves JSON imports at bundle time
@@ -30,8 +31,8 @@ export function reportClientError(
       source: "cli",
       version: CLI_VERSION,
       error_type: errorType,
-      message: message.slice(0, 500),
-      context,
+      message: redactSecrets(message).slice(0, 500),
+      context: context ? redactSecretsDeep(context) : context,
     }),
   }).catch(() => {});
 }
