@@ -271,7 +271,7 @@ adminRoutes.post("/admin/reclaim-handle", async (c) => {
 //   - rare → grantable to a specific address; recipient registers normally
 // All endpoints SUSU_ADMIN_TOKEN-gated via adminGuard.
 
-const RESERVED_NAME_RE = /^[a-z0-9_-]{1,40}$/;
+const RESERVED_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 const RESERVED_CATEGORIES = new Set(["system", "rare", "obscenity"] as const);
 type ReservedCategory = "system" | "rare" | "obscenity";
 

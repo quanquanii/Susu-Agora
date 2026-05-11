@@ -99,8 +99,8 @@ identityRoutes.get("/identity/whoami", async (c) => {
 //   - Reserved table further blocks system / obscenity / specifically-locked
 //     rare names. Rare names with `granted_to = caller` pass through.
 //   - Validation happens in this order so error messages are precise.
-const USERNAME_RE_SELF_SERVE = /^[a-z0-9_-]{5,20}$/;
-const USERNAME_RE_DB_LIMIT = /^[a-z0-9_-]{3,20}$/;  // hard floor (matches DB CHECK)
+const USERNAME_RE_SELF_SERVE = /^[a-z0-9][a-z0-9_-]{4,19}$/;
+const USERNAME_RE_DB_LIMIT = /^[a-z0-9][a-z0-9_-]{2,19}$/;  // hard floor — first char must be alnum to prevent CLI flag confusion (--flag)
 
 identityRoutes.post("/identity/register", async (c) => {
   const ip = clientIp(c);
