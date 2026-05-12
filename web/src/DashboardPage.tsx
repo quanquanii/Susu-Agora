@@ -1105,10 +1105,10 @@ function FriendsPage() {
                 <div className="rec-friend-card">
                   <div className="friend-avatar" style={{ color: "var(--green)" }}>D</div>
                   <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontSize: 12, color: "var(--ink)" }}>@demo1</div>
+                    <div style={{ fontSize: 12, color: "var(--ink)" }}>@demo</div>
                     <div style={{ fontSize: 10, color: "var(--ink-faint)", marginTop: 2, lineHeight: 1.4 }}>{t("friends.recDesc")}</div>
                   </div>
-                  <button className="add-btn" onClick={() => handleAdd("demo1")} style={{ flexShrink: 0 }}>{t("friends.add")}</button>
+                  <button className="add-btn" onClick={() => handleAdd("demo")} style={{ flexShrink: 0 }}>{t("friends.add")}</button>
                 </div>
               </>
             )}
@@ -1118,7 +1118,7 @@ function FriendsPage() {
                 <div className="rec-friend-card" style={{ opacity: 0.6 }}>
                   <div className="friend-avatar" style={{ color: "var(--green)" }}>D</div>
                   <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontSize: 12, color: "var(--ink)" }}>@demo1</div>
+                    <div style={{ fontSize: 12, color: "var(--ink)" }}>@demo</div>
                     <div style={{ fontSize: 10, color: "var(--ink-faint)", marginTop: 2, lineHeight: 1.4 }}>{t("friends.recDesc")}</div>
                   </div>
                   <span style={{ fontSize: 11, color: "var(--green)", flexShrink: 0 }}>{t("friends.added")}</span>

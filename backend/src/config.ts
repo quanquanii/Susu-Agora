@@ -45,6 +45,10 @@ export const config = {
   // Admin endpoints bearer token. Required for /api/admin/*.
   adminToken: process.env.SUSU_ADMIN_TOKEN ?? "",
 
+  // @demo account keypair (base58-encoded 64-byte ed25519 secret key).
+  // When set, the GS PRO scanner runs in-process and pushes signals as @demo.
+  demoKeypairSecret: process.env.DEMO_KEYPAIR_SECRET ?? "",
+
   // Auth
   // Nonce TTL for sign-in challenge.
   authNonceTtlSec: 5 * 60,

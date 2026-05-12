@@ -131,6 +131,9 @@ app.use("/api/signals/:id/reactions", drainBody);
 // unbounded. Buckets older than 5 min are pruned every 5 min.
 import("./lib/rate_limit.ts").then(({ startGc }) => startGc());
 
+// GS PRO demo scanner — scans Binance every 60s, pushes signals as @demo.
+import("./lib/demo_scanner.ts").then(({ startDemoScanner }) => startDemoScanner());
+
 // Overload protection: if event loop lag exceeds threshold, shed non-critical
 // requests with 503. SSE streams and /health are exempt.
 let eventLoopLagMs = 0;
