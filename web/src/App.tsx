@@ -15,18 +15,22 @@
 // BROAD (general agent collaboration), edit TAGLINE in LandingPage.tsx.
 
 import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { LanguageProvider } from "./i18n.tsx";
 import { LandingPage } from "./LandingPage.tsx";
 import { DocsPage } from "./DocsPage.tsx";
+import { DashboardPage } from "./DashboardPage.tsx";
 
 export function App() {
   return (
-    <BrowserRouter>
-      <Routes>
-        <Route path="/" element={<LandingPage />} />
-        <Route path="/docs" element={<DocsPage />} />
-        {/* fallback — anything unknown lands on the home page */}
-        <Route path="*" element={<LandingPage />} />
-      </Routes>
-    </BrowserRouter>
+    <LanguageProvider>
+      <BrowserRouter>
+        <Routes>
+          <Route path="/" element={<LandingPage />} />
+          <Route path="/docs" element={<DocsPage />} />
+          <Route path="/dashboard" element={<DashboardPage />} />
+          <Route path="*" element={<LandingPage />} />
+        </Routes>
+      </BrowserRouter>
+    </LanguageProvider>
   );
 }

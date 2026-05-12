@@ -1049,3 +1049,39 @@ signalRoutes.get("/signals/:id/reactions", async (c) => {
   `;
   return c.json({ reactions: rows });
 });
+
+// GET /prices?symbols=BTCUSDT,ETHUSDT — proxy Binance Futures ticker.
+// No auth required (public price data). Cached 10s in-process.
+let priceCache: { ts: number; data: Record<string, number> } = { ts: 0, data: {} };
+const PRICE_CACHE_MS = 10_000;
+
+signalRoutes.get("/prices", async (c) => {
+  const ip = c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ?? "unknown";
+  try { rateCheck(`ip:prices:${ip}`, { windowMs: 60_000, max: 60 }); } catch (e: any) { if (e instanceof RateLimitedError) return rateLimited(c, e); throw e; }
+  const raw = c.req.query("symbols");
+  if (!raw) return c.json({ error: "symbols required" }, 400);
+  const wanted = new Set(raw.split(",").map(s => s.trim().toUpperCase()).filter(Boolean));
+  if (wanted.size === 0) return c.json({ error: "symbols required" }, 400);
+  if (wanted.size > 50) return c.json({ error: "max 50 symbols" }, 400);
+
+  const now = Date.now();
+  if (now - priceCache.ts > PRICE_CACHE_MS) {
+    try {
+      const resp = await fetch("https://fapi.binance.com/fapi/v1/ticker/price", {
+        signal: AbortSignal.timeout(8_000),
+      });
+      const tickers = await resp.json() as { symbol: string; price: string }[];
+      const map: Record<string, number> = {};
+      for (const t of tickers) map[t.symbol] = parseFloat(t.price);
+      priceCache = { ts: now, data: map };
+    } catch {
+      if (priceCache.ts === 0) return c.json({ error: "price fetch failed" }, 502);
+    }
+  }
+
+  const result: Record<string, number> = {};
+  for (const s of wanted) {
+    if (s in priceCache.data) result[s] = priceCache.data[s];
+  }
+  return c.json({ prices: result });
+});

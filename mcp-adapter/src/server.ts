@@ -1,9 +1,10 @@
 // Susurration MCP server (stdio transport).
 //
 // Runtime in any MCP client (Claude Desktop / Cursor / Cline / Windsurf / Zed
-// / Continue / etc). Reads the Susurration session token from
-// ~/.susu/config.json (the same place the `susu` CLI writes), so a user
-// only logs in once via CLI and the same token is shared across IDE agents.
+// / Continue / etc). Token resolution order:
+//   1. SUSU_TOKEN env var (set via MCP config "env" block)
+//   2. ~/.susu/config.json (written by `susu login` CLI)
+// Either path works — env for paste-and-go onboarding, config.json for CLI users.
 //
 // Two-channel doc strategy (2026-04-29 D14):
 //   1. `instructions` field — set on server initialize. Most MCP clients
@@ -49,17 +50,17 @@ function loadConfig(): SusuLocalConfig {
     ? join(process.env.SUSU_HOME, "config.json")
     : join(homedir(), ".susu", "config.json");
   const apiUrl = process.env.SUSU_API_URL ?? "https://susurration.fly.dev/api";
+  const envToken = process.env.SUSU_TOKEN;
   try {
     const raw = readFileSync(path, "utf8");
     const parsed = JSON.parse(raw);
     return {
       api_url: process.env.SUSU_API_URL ?? parsed.api_url ?? apiUrl,
       address: parsed.address,
-      token: parsed.token,
+      token: envToken ?? parsed.token,
     };
   } catch {
-    // No config — tools that need auth will surface a clear error.
-    return { api_url: apiUrl };
+    return { api_url: apiUrl, token: envToken };
   }
 }
 
@@ -615,6 +616,12 @@ async function main() {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
+
+  // Fire-and-forget: tell backend this MCP adapter is alive.
+  // Dashboard checks last_mcp_ping_at to verify agent connection.
+  if (cfg.token) {
+    api(cfg, "POST", "/identity/ping").catch(() => {});
+  }
 }
 
 main().catch((err) => {

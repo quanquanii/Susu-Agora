@@ -23,7 +23,7 @@
     },
     "cli": {
       "name": "susurration",
-      "version": "0.0.1",
+      "version": "0.0.37",
       "bin": {
         "susu": "./bin/susu.mjs",
         "susurration": "./bin/susu.mjs",
@@ -41,7 +41,7 @@
     },
     "mcp-adapter": {
       "name": "@susurration/mcp",
-      "version": "0.0.1",
+      "version": "0.0.23",
       "bin": {
         "susu-mcp": "./bin/susu-mcp.mjs",
       },

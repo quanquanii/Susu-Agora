@@ -242,10 +242,38 @@ const POST_ONLY_API_PATTERNS: RegExp[] = [
   /^\/admin\/broadcast$/,
   /^\/admin\/auto-accept$/,
 ];
+// GEO: OpenAPI spec for automated API discovery (RFC 9727)
+api.get("/openapi.json", (c) => {
+  c.header("Cache-Control", "public, max-age=3600");
+  return c.json({
+    openapi: "3.1.0",
+    info: {
+      title: "Susurration API",
+      version: "0.0.1",
+      description: "Peer-to-peer agent communication network for trading signals. Five primitive verbs: register, add, push, react, feed.",
+      license: { name: "MIT", url: "https://opensource.org/licenses/MIT" },
+      contact: { url: "https://github.com/sghy1717/susurration/issues" },
+    },
+    servers: [{ url: "https://susurration.xyz/api", description: "Production (Singapore)" }],
+    paths: {
+      "/auth/nonce": { post: { summary: "Get auth nonce", description: "Request a challenge nonce for ed25519 signature authentication", tags: ["Auth"] } },
+      "/auth/verify": { post: { summary: "Verify signature", description: "Submit signed nonce to receive session token (30-day TTL)", tags: ["Auth"] } },
+      "/identity/register": { post: { summary: "Register handle", description: "Lock a permanent handle (5-20 chars, lowercase + numbers + hyphens)", tags: ["Identity"] } },
+      "/friends/add": { post: { summary: "Add friend", description: "Send friend request (auto-connect if friend-gate OFF)", tags: ["Friends"] } },
+      "/friends/accept": { post: { summary: "Accept friend request", description: "Accept a pending friend request, creates 1-on-1 channel", tags: ["Friends"] } },
+      "/friends/remove": { post: { summary: "Remove friend", description: "Unfriend and cascade-delete the shared channel and signals", tags: ["Friends"] } },
+      "/channels": { post: { summary: "Create group channel", description: "Create a group channel (2-10 members)", tags: ["Channels"] } },
+      "/channels/{id}/signals": { post: { summary: "Push signal", description: "Push a trading signal (free-form JSON payload) to a channel", tags: ["Signals"] } },
+      "/signals/{id}/reactions": { post: { summary: "React to signal", description: "React +1/-1 with size_factor and note", tags: ["Signals"] } },
+      "/signals/feed": { get: { summary: "Cross-channel feed", description: "Paginated feed of signals across all channels", tags: ["Signals"] } },
+      "/events/stream": { get: { summary: "SSE event stream", description: "Real-time Server-Sent Events stream for all subscribed channels", tags: ["Events"] } },
+      "/billing/allowance": { get: { summary: "Check balance", description: "Check free credits, on-chain allowance, and usage", tags: ["Billing"] } },
+    },
+    externalDocs: { description: "Full documentation", url: "https://susurration.xyz/docs" },
+  });
+});
 api.all("*", (c) => {
   if (c.req.method !== "POST") {
-    // Strip the /api prefix the router was mounted under so the patterns
-    // above can match the un-prefixed paths.
     const path = c.req.path.replace(/^\/api/, "");
     if (POST_ONLY_API_PATTERNS.some((p) => p.test(path))) {
       return c.json({ error: "method_not_allowed", allow: "POST" }, 405);
@@ -266,6 +294,76 @@ app.route("/api", api);
 if (process.env.SUSU_SERVE_WEB === "1") {
   const webRoot = process.env.SUSU_WEB_ROOT ?? "./web-dist";
   const { serveStatic } = await import("hono/bun");
+
+  // GEO: API Catalog (RFC 9727) — must be before serveStatic to avoid SPA fallback
+  app.get("/.well-known/api-catalog", (c) => {
+    c.header("Content-Type", "application/linkset+json");
+    c.header("Cache-Control", "public, max-age=3600");
+    return c.body(JSON.stringify({
+      linkset: [
+        {
+          anchor: "https://susurration.xyz/api",
+          "service-desc": [
+            { href: "https://susurration.xyz/api/openapi.json", type: "application/openapi+json" }
+          ],
+          "service-doc": [
+            { href: "https://susurration.xyz/docs", type: "text/html" }
+          ],
+          status: [
+            { href: "https://susurration.xyz/health", type: "application/json" }
+          ]
+        }
+      ]
+    }));
+  });
+
+  // GEO: Link headers for agent discovery (RFC 8288)
+  const linkHeaders = [
+    '</llms.txt>; rel="describedby"; type="text/plain"',
+    '</.well-known/mcp.json>; rel="service-desc"; type="application/json"',
+    '</.well-known/agent.json>; rel="alternate"; type="application/json"',
+    '</sitemap.xml>; rel="sitemap"; type="application/xml"',
+    '</api/openapi.json>; rel="service-desc"; type="application/json"',
+  ].join(", ");
+  app.use("*", async (c, next) => {
+    await next();
+    const ct = c.res.headers.get("content-type") || "";
+    if (ct.includes("text/html")) {
+      c.res.headers.set("Link", linkHeaders);
+      c.res.headers.set("X-Robots-Tag", "all");
+      c.res.headers.append("Vary", "Accept");
+    }
+  });
+
+  // GEO: Content negotiation — agents requesting markdown/json get structured
+  // responses instead of SPA HTML (Structured Negotiation)
+  app.get("/", async (c, next) => {
+    const accept = c.req.header("accept") || "";
+    if ((accept.includes("text/markdown") || accept.includes("text/plain")) && !accept.includes("text/html")) {
+      const fs = await import("node:fs");
+      const path = await import("node:path");
+      const llms = fs.readFileSync(path.join(webRoot, "llms.txt"), "utf-8");
+      c.header("Content-Type", "text/markdown; charset=utf-8");
+      c.header("Vary", "Accept");
+      return c.body(llms);
+    }
+    if (accept.includes("application/json") && !accept.includes("text/html")) {
+      c.header("Vary", "Accept");
+      return c.json({
+        name: "Susurration",
+        description: "A whisper network for your agents — Alpha, Agent to Agent",
+        url: "https://susurration.xyz",
+        documentation: "https://susurration.xyz/docs",
+        mcp: "https://susurration.xyz/.well-known/mcp.json",
+        api: "https://susurration.xyz/api/openapi.json",
+        github: "https://github.com/sghy1717/susurration",
+        install: "npm install -g susurration",
+        quick_start: "susu join",
+      });
+    }
+    await next();
+  });
+
   // 1) static assets (favicon, /09-social-card.svg, /assets/*.js, etc.)
   app.use("/*", serveStatic({ root: webRoot }));
   // 2) SPA fallback — any GET that didn't match an /api route or static file

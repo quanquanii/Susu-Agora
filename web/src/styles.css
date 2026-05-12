@@ -20,9 +20,22 @@
   --paper:      #0b0f1a;       /* deep blue-black; not pure black, keeps cold tone */
   --ink:        #a5b4c7;       /* cold dim blue — primary text */
   --whisper:    #C9A961;       /* BETA badge / accent — warm against cold blue */
-  --ink-soft:   rgba(165, 180, 199, 0.65);
-  --ink-faint:  rgba(165, 180, 199, 0.40);
+  --ink-soft:   rgba(165, 180, 199, 0.72);
+  --ink-faint:  rgba(165, 180, 199, 0.55);
   --ink-trace:  rgba(165, 180, 199, 0.15);
+
+  /* Surface / border tokens (shared with dashboard) */
+  --surface:    #111827;
+  --surface2:   #1a2332;
+  --surface3:   #212d40;
+  --border-base: rgba(165, 180, 199, 0.10);
+  --border2:    rgba(165, 180, 199, 0.18);
+  --green:      #10b981;
+  --green-d:    rgba(16, 185, 129, 0.12);
+  --red:        #ef4444;
+  --red-d:      rgba(239, 68, 68, 0.12);
+  --blue:       #3b82f6;
+  --blue-d:     rgba(59, 130, 246, 0.12);
 
   /* Syntax-highlight tokens — Tokyo-Night-inspired, picked to read
      comfortably on the deep blue-black background. */
@@ -38,22 +51,6 @@
   --serif:      'Iowan Old Style', Charter, 'DejaVu Serif', Georgia, 'Times New Roman', serif;
   --mono:       'JetBrains Mono', 'IBM Plex Mono', 'SF Mono', Menlo, Consolas, monospace;
 
-  /* ─── Onboarding dark tokens (kept for /onboarding route) ─── */
-  --bg:           #0a0a0a;
-  --surface:      #111111;
-  --surface-2:    #1a1a1a;
-  --surface-3:    #222222;
-  --border:       #2a2a2a;
-  --border-light: #333333;
-  --text:         #f5f5f5;
-  --text-2:       #999999;
-  --text-3:       #555555;
-  --green:        #10b981;
-  --green-dim:    #065f46;
-  --blue:         #3b82f6;
-  --blue-dim:     #1d40ae;
-  --yellow:       #f59e0b;
-  --red:          #ef4444;
 }
 
 html, body, #root {
@@ -62,6 +59,8 @@ html, body, #root {
 
 body {
   font-family: var(--mono);
+  background: var(--paper);
+  color: var(--ink);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
@@ -104,6 +103,21 @@ body {
 }
 
 .landing-nav .links a:hover { color: var(--ink); }
+
+/* Language toggle */
+.lang-toggle {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-faint);
+  background: none;
+  border: 0.5px solid var(--border2);
+  padding: 3px 10px;
+  cursor: pointer;
+  letter-spacing: 0.5px;
+  transition: color 150ms, border-color 150ms;
+  border-radius: 3px;
+}
+.lang-toggle:hover { color: var(--ink); border-color: var(--ink-faint); }
 
 /* hero */
 .landing-main {
@@ -188,13 +202,22 @@ body {
   top: -1px;
 }
 
+/* landing description line */
+.landing-desc {
+  font-size: 12px;
+  line-height: 1.8;
+  color: var(--ink-faint);
+  max-width: 440px;
+  margin: 28px auto 0;
+}
+
 /* actions */
 .actions {
   display: flex;
   gap: 16px;
   justify-content: center;
   align-items: center;
-  margin-top: 48px;
+  margin-top: 40px;
   flex-wrap: wrap;
 }
 

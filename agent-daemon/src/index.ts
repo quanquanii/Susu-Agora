@@ -540,6 +540,8 @@ async function runOneStream(
   }
 }
 
+const SIGNAL_EXPIRY_MS = 60 * 60 * 1000; // 1 hour
+
 async function handleEvent(
   evt: any,
   susu: SusuClientConfig,
@@ -549,6 +551,20 @@ async function handleEvent(
   cfg: DaemonConfig,
   paperTrader: PaperTrader | null,
 ): Promise<void> {
+  // Skip expired signals — signals older than 1 hour are not actionable.
+  // They remain in history as "missed" but the agent does not evaluate or act.
+  if (evt.created_at) {
+    const ageMs = Date.now() - new Date(evt.created_at).getTime();
+    if (ageMs > SIGNAL_EXPIRY_MS) {
+      const ageMin = Math.round(ageMs / 60_000);
+      process.stderr.write(
+        `[daemon] expired: ${evt.kind} ${(evt.signal_id ?? evt.reaction_id ?? "?").slice(0, 8)}… ` +
+        `is ${ageMin}min old (>${Math.round(SIGNAL_EXPIRY_MS / 60_000)}min); skipped\n`,
+      );
+      return;
+    }
+  }
+
   if (!limiter.tryConsume()) {
     process.stderr.write(`[daemon] rate-limited (>${cfg.agent.max_calls_per_minute}/min); skipping event\n`);
     return;
