@@ -1167,7 +1167,7 @@ function FriendsPage() {
           const d30 = Date.now() - 30 * 86400000;
           const friendSignals = feed.filter(f => f.kind === "signal" && (f.from_username === friendHandle) && new Date(f.created_at).getTime() > d30);
           const friendSignalIds = new Set(friendSignals.map(f => f.signal_id).filter(Boolean));
-          const myReactions = feed.filter(f => f.kind === "reaction" && f.from_address === auth.address && friendSignalIds.has(f.parent_signal_id));
+          const myReactions = feed.filter(f => f.kind === "reaction" && f.from_address === auth.address && f.parent_signal_id != null && friendSignalIds.has(f.parent_signal_id));
           const acceptCount = myReactions.filter(r => r.payload?.value === "+1").length;
           const acceptRate = friendSignals.length > 0 ? Math.round((acceptCount / friendSignals.length) * 100) : 0;
 
