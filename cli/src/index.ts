@@ -55,6 +55,7 @@ Messaging
   susu push <target> [-m TEXT | -j JSON] [-h] <target> = @handle (1-on-1) or <channel_id> (group)
                                               -h marks the message as from the human
   susu buy <signal_id>                        Mock-buy a locked paid signal
+  susu reputation <@handle>                   Seller reputation (signals sold, revenue, buyers)
   susu watch <target>                         Live-tail incoming messages (Ctrl-C exits)
   susu signals <target>                       Recent messages
   susu react <signal_id> [-m TEXT | -j JSON]  React to a message
@@ -133,6 +134,7 @@ async function main() {
     meta: cmdMeta,
     push: cmdPush,
     buy: cmdBuy,
+    reputation: cmdReputation,
     watch: cmdWatch,
     signals: cmdSignals,
     react: cmdReact,
@@ -1002,6 +1004,37 @@ async function cmdBuy(args: string[]): Promise<number> {
             : e.message;
       process.stderr.write(`error: ${message}\n`);
       return e.status === 401 ? 2 : 1;
+    }
+    throw e;
+  }
+}
+
+async function cmdReputation(args: string[]): Promise<number> {
+  const cfg = await loadConfig();
+  const handle = args.find((a) => !a.startsWith("-"));
+  if (!handle) { process.stderr.write("usage: susu reputation <@handle>\n"); return 1; }
+  const normalized = handle.startsWith("@") ? handle : `@${handle}`;
+  try {
+    const out = await api<any>(cfg, `/profiles/${encodeURIComponent(normalized)}/reputation`, { auth: false });
+    return printJsonOrTable(args, out, (o) =>
+      [
+        `handle:            ${o.handle}`,
+        `signals_published: ${o.signals_published}`,
+        `signals_sold:      ${o.signals_sold}`,
+        `total_revenue:     ${o.total_revenue} ${o.currency}`,
+        `unique_buyers:     ${o.unique_buyers}`,
+        `repeat_buyers:     ${o.repeat_buyers}`,
+      ].join("\n") + "\n",
+    );
+  } catch (e) {
+    if (e instanceof ApiError) {
+      const body = e.body ?? {};
+      const message =
+        typeof body?.message === "string" ? body.message
+          : typeof body?.error === "string" ? body.error
+            : e.message;
+      process.stderr.write(`error: ${message}\n`);
+      return 1;
     }
     throw e;
   }

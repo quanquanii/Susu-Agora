@@ -1278,6 +1278,225 @@ describeE2E("Susurration E2E (D7+D13)", () => {
     expect(add.status).toBe(201);
   });
 
+  // ── Seller reputation v1 ─────────────────────────────────────────
+
+  test("reputation: unknown handle returns zeroed stats (not 404)", async () => {
+    const r = await app.fetch(new Request("http://test/api/profiles/@nobody_xyz_9999/reputation"));
+    expect(r.status).toBe(200);
+    const body = await r.json() as any;
+    expect(body.handle).toBe("@nobody_xyz_9999");
+    expect(body.signals_published).toBe(0);
+    expect(body.signals_sold).toBe(0);
+    expect(body.unique_buyers).toBe(0);
+    expect(body.repeat_buyers).toBe(0);
+  });
+
+  test("reputation: alice sells one signal to bob — baseline stats correct", async () => {
+    await sqlMod.sql`TRUNCATE purchases, register_ips RESTART IDENTITY`;
+    const wA = makeWallet(); const tA = await login(wA);
+    const wB = makeWallet(); const tB = await login(wB);
+    const aU = uname("repa"); await register(tA, aU);
+    const bU = uname("repb"); await register(tB, bU);
+    await sqlMod.sql`UPDATE identities SET auto_accept_friends = true WHERE address = ${wB.address}`;
+    const add = await app.fetch(new Request("http://test/api/friends/add", {
+      method: "POST", headers: authHeaders(tA), body: JSON.stringify({ username: bU }),
+    }));
+    const { channel_id } = await add.json() as any;
+
+    if (!requireRate(0)) { return; }
+
+    // Alice pushes one plain (unpaid) signal and one paid signal.
+    await app.fetch(new Request(`http://test/api/channels/${channel_id}/signals`, {
+      method: "POST", headers: authHeaders(tA), body: JSON.stringify({ type: "plain" }),
+    }));
+
+    const paidPush = await app.fetch(new Request(`http://test/api/channels/${channel_id}/signals`, {
+      method: "POST", headers: authHeaders(tA), body: JSON.stringify({
+        type: "trade_entry",
+        locked: true,
+        price: "0.01",
+        currency: "USDC",
+        unlock_policy: "pay_to_reveal",
+        expires_at: "2030-01-01T00:00:00.000Z",
+        public_payload: { summary: "BTC long" },
+        private_payload: { entry_price: 65000 },
+      }),
+    }));
+    expect(paidPush.status).toBe(201);
+    const { signal_id } = await paidPush.json() as any;
+
+    // Bob buys the signal.
+    const buy = await app.fetch(new Request("http://test/api/purchases", {
+      method: "POST", headers: authHeaders(tB), body: JSON.stringify({ signal_id }),
+    }));
+    expect(buy.status).toBe(201);
+
+    // Reputation for alice.
+    const rep = await app.fetch(new Request(`http://test/api/profiles/@${aU}/reputation`));
+    expect(rep.status).toBe(200);
+    const body = await rep.json() as any;
+    expect(body.handle).toBe(`@${aU}`);
+    expect(body.signals_published).toBeGreaterThanOrEqual(2); // plain + paid
+    expect(body.signals_sold).toBe(1);
+    expect(Number(body.total_revenue)).toBeCloseTo(0.01);
+    expect(body.currency).toBe("USDC");
+    expect(body.unique_buyers).toBe(1);
+    expect(body.repeat_buyers).toBe(0);
+  });
+
+  test("reputation: duplicate buy does not increase sold/revenue/repeat_buyers", async () => {
+    await sqlMod.sql`TRUNCATE purchases, register_ips RESTART IDENTITY`;
+    const wA = makeWallet(); const tA = await login(wA);
+    const wB = makeWallet(); const tB = await login(wB);
+    const aU = uname("repca"); await register(tA, aU);
+    const bU = uname("repcb"); await register(tB, bU);
+    await sqlMod.sql`UPDATE identities SET auto_accept_friends = true WHERE address = ${wB.address}`;
+    const add = await app.fetch(new Request("http://test/api/friends/add", {
+      method: "POST", headers: authHeaders(tA), body: JSON.stringify({ username: bU }),
+    }));
+    const { channel_id } = await add.json() as any;
+
+    if (!requireRate(0)) { return; }
+
+    const paidPush = await app.fetch(new Request(`http://test/api/channels/${channel_id}/signals`, {
+      method: "POST", headers: authHeaders(tA), body: JSON.stringify({
+        locked: true, price: "0.01", currency: "USDC",
+        unlock_policy: "pay_to_reveal", expires_at: "2030-01-01T00:00:00.000Z",
+        public_payload: { summary: "ETH long" }, private_payload: { note: "s" },
+      }),
+    }));
+    expect(paidPush.status).toBe(201);
+    const { signal_id } = await paidPush.json() as any;
+
+    await app.fetch(new Request("http://test/api/purchases", {
+      method: "POST", headers: authHeaders(tB), body: JSON.stringify({ signal_id }),
+    }));
+    // Duplicate buy — idempotent, no new row.
+    await app.fetch(new Request("http://test/api/purchases", {
+      method: "POST", headers: authHeaders(tB), body: JSON.stringify({ signal_id }),
+    }));
+
+    const rep = await app.fetch(new Request(`http://test/api/profiles/@${aU}/reputation`));
+    const body = await rep.json() as any;
+    expect(body.signals_sold).toBe(1);
+    expect(Number(body.total_revenue)).toBeCloseTo(0.01);
+    expect(body.unique_buyers).toBe(1);
+    expect(body.repeat_buyers).toBe(0);
+  });
+
+  test("reputation: pending/failed/refunded purchases do not count", async () => {
+    await sqlMod.sql`TRUNCATE purchases, register_ips RESTART IDENTITY`;
+    const wA = makeWallet(); const tA = await login(wA);
+    const wB = makeWallet(); const tB = await login(wB);
+    const aU = uname("repda"); await register(tA, aU);
+    const bU = uname("repdb"); await register(tB, bU);
+    await sqlMod.sql`UPDATE identities SET auto_accept_friends = true WHERE address = ${wB.address}`;
+    const add = await app.fetch(new Request("http://test/api/friends/add", {
+      method: "POST", headers: authHeaders(tA), body: JSON.stringify({ username: bU }),
+    }));
+    const { channel_id } = await add.json() as any;
+
+    if (!requireRate(0)) { return; }
+
+    // Create three signals, each with a non-paid purchase inserted directly.
+    const createSig = async () => {
+      const r = await app.fetch(new Request(`http://test/api/channels/${channel_id}/signals`, {
+        method: "POST", headers: authHeaders(tA), body: JSON.stringify({
+          locked: true, price: "1.00", currency: "USDC",
+          unlock_policy: "pay_to_reveal", expires_at: "2030-01-01T00:00:00.000Z",
+          public_payload: { summary: "x" }, private_payload: { note: "y" },
+        }),
+      }));
+      expect(r.status).toBe(201);
+      return (await r.json() as any).signal_id as string;
+    };
+
+    for (const status of ["pending", "failed", "refunded"] as const) {
+      const sig_id = await createSig();
+      await sqlMod.sql`
+        INSERT INTO purchases(signal_id, buyer_handle, seller_handle, amount, currency, status, tx_hash)
+        VALUES (${sig_id}, ${`@${bU}`}, ${`@${aU}`}, '1.00', 'USDC', ${status}, ${`mock_tx_${status}`})
+      `;
+    }
+
+    const rep = await app.fetch(new Request(`http://test/api/profiles/@${aU}/reputation`));
+    const body = await rep.json() as any;
+    expect(body.signals_sold).toBe(0);
+    expect(Number(body.total_revenue)).toBe(0);
+    expect(body.unique_buyers).toBe(0);
+    expect(body.repeat_buyers).toBe(0);
+  });
+
+  test("reputation: one buyer buys two different paid signals — repeat_buyers becomes 1", async () => {
+    await sqlMod.sql`TRUNCATE purchases, register_ips RESTART IDENTITY`;
+    const wA = makeWallet(); const tA = await login(wA);
+    const wB = makeWallet(); const tB = await login(wB);
+    const aU = uname("repea"); await register(tA, aU);
+    const bU = uname("repeb"); await register(tB, bU);
+    await sqlMod.sql`UPDATE identities SET auto_accept_friends = true WHERE address = ${wB.address}`;
+    const add = await app.fetch(new Request("http://test/api/friends/add", {
+      method: "POST", headers: authHeaders(tA), body: JSON.stringify({ username: bU }),
+    }));
+    const { channel_id } = await add.json() as any;
+
+    if (!requireRate(0)) { return; }
+
+    const createPaidSig = async (summary: string) => {
+      const r = await app.fetch(new Request(`http://test/api/channels/${channel_id}/signals`, {
+        method: "POST", headers: authHeaders(tA), body: JSON.stringify({
+          locked: true, price: "0.01", currency: "USDC",
+          unlock_policy: "pay_to_reveal", expires_at: "2030-01-01T00:00:00.000Z",
+          public_payload: { summary }, private_payload: { note: "priv" },
+        }),
+      }));
+      expect(r.status).toBe(201);
+      return (await r.json() as any).signal_id as string;
+    };
+
+    const sig1 = await createPaidSig("signal one");
+    const sig2 = await createPaidSig("signal two");
+
+    await app.fetch(new Request("http://test/api/purchases", {
+      method: "POST", headers: authHeaders(tB), body: JSON.stringify({ signal_id: sig1 }),
+    }));
+    await app.fetch(new Request("http://test/api/purchases", {
+      method: "POST", headers: authHeaders(tB), body: JSON.stringify({ signal_id: sig2 }),
+    }));
+
+    const rep = await app.fetch(new Request(`http://test/api/profiles/@${aU}/reputation`));
+    const body = await rep.json() as any;
+    expect(body.signals_sold).toBe(2);
+    expect(Number(body.total_revenue)).toBeCloseTo(0.02);
+    expect(body.unique_buyers).toBe(1);
+    expect(body.repeat_buyers).toBe(1);
+  });
+
+  test("reputation: plain unpaid signals count in signals_published but not signals_sold", async () => {
+    await sqlMod.sql`TRUNCATE purchases, register_ips RESTART IDENTITY`;
+    const wA = makeWallet(); const tA = await login(wA);
+    const aU = uname("repfa"); await register(tA, aU);
+
+    if (!requireRate(0)) { return; }
+
+    // Alice creates a solo group to push plain signals without needing a friend.
+    const create = await app.fetch(new Request("http://test/api/channels", {
+      method: "POST", headers: authHeaders(tA), body: JSON.stringify({ name: "solo-rep" }),
+    }));
+    const { channel_id } = await create.json() as any;
+
+    for (let i = 0; i < 3; i++) {
+      await app.fetch(new Request(`http://test/api/channels/${channel_id}/signals`, {
+        method: "POST", headers: authHeaders(tA), body: JSON.stringify({ type: "plain", idx: i }),
+      }));
+    }
+
+    const rep = await app.fetch(new Request(`http://test/api/profiles/@${aU}/reputation`));
+    const body = await rep.json() as any;
+    expect(body.signals_published).toBeGreaterThanOrEqual(3);
+    expect(body.signals_sold).toBe(0);
+    expect(Number(body.total_revenue)).toBe(0);
+  });
+
   // ── Events (admin analytics — only that the rows show up) ─────────
 
   test("events: register + friend_add_accepted + signal_push are recorded", async () => {

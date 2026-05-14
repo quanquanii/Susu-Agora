@@ -16,6 +16,7 @@ import { friendRoutes } from "./routes/friends.ts";
 import { clientErrorRoutes } from "./routes/client_errors.ts";
 import { adminRoutes } from "./routes/admin.ts";
 import { purchaseRoutes } from "./routes/purchases.ts";
+import { reputationRoutes } from "./routes/reputation.ts";
 import { validateSolanaConfig } from "./lib/solana.ts";
 
 // R3: validate Solana cluster/RPC/mint at startup. Mismatches silently lose
@@ -221,6 +222,7 @@ api.route("/", friendRoutes);
 api.route("/", channelRoutes);
 api.route("/", signalRoutes);
 api.route("/", purchaseRoutes);
+api.route("/", reputationRoutes);
 api.route("/", billingRoutes);
 api.route("/", clientErrorRoutes);
 // Admin routes registered BEFORE the catch-all so /api/admin/* doesn't 404.
