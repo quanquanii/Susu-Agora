@@ -1330,13 +1330,21 @@ function renderPaidSignalPayload(payload: unknown, fromMe: boolean): PaidSignalR
 
   const publicPayload = isRecord(payload.public_payload) ? payload.public_payload : {};
   const privatePayload = isRecord(payload.private_payload) ? payload.private_payload : null;
+  const viewerRole =
+    payload.viewer_role === "author" || payload.viewer_role === "buyer" || payload.viewer_role === "locked"
+      ? payload.viewer_role
+      : null;
+  const purchased = payload.purchased === true;
 
   const price = asDisplayValue(payload.price);
   const currency = asNonEmptyString(payload.currency);
   const summary = asNonEmptyString(publicPayload.summary);
   const token = asNonEmptyString(publicPayload.token);
   const direction = asNonEmptyString(publicPayload.direction);
-  const visibilityTag = privatePayload ? (fromMe ? "[AUTHOR]" : "[UNLOCKED]") : null;
+  const visibilityTag =
+    viewerRole === "author"
+      ? "[AUTHOR]"
+      : (!viewerRole && privatePayload && fromMe ? "[AUTHOR]" : null);
 
   const privateDetails: Array<[string, string]> = [];
   if (privatePayload) {
@@ -1352,7 +1360,11 @@ function renderPaidSignalPayload(payload: unknown, fromMe: boolean): PaidSignalR
     if (reason) privateDetails.push(["reason", reason]);
   }
 
-  const headerParts = ["[LOCKED]"];
+  const headerLabel =
+    viewerRole === "buyer" || purchased || (!viewerRole && privatePayload && !fromMe)
+      ? "[UNLOCKED]"
+      : "[LOCKED]";
+  const headerParts = [headerLabel];
   if (price && currency) headerParts.push(`${price} ${currency}`);
 
   const plainParts = [headerParts.join(" ")];

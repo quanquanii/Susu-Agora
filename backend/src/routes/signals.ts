@@ -22,7 +22,11 @@ import { check as rateCheck, RateLimitedError } from "../lib/rate_limit.ts";
 import { recordEvent } from "../lib/events.ts";
 import { buildAllowanceResponse } from "./billing.ts";
 import { deliverToChannelMembers } from "../lib/webhook.ts";
-import { clipSignalEventForViewer, clipSignalPayloadForViewer } from "../lib/paid_signals.ts";
+import {
+  clipSignalEventForViewer,
+  clipSignalPayloadForViewer,
+  loadPaidPurchaseSignalIdsForViewer,
+} from "../lib/paid_signals.ts";
 import { stripControlCharsDeep } from "../../../shared/strip-control.ts";
 
 const APPROVE_AGAIN_URL = "https://susurration.xyz/approve?amount=100";
@@ -485,7 +489,10 @@ signalRoutes.post("/channels/:id/signals", async (c) => {
 });
 
 // GET /channels/:id/signals?since=ISO&limit=N — fetch signal log.
-// Paid-signal rule: non-authors do NOT receive private_payload here.
+// Paid-signal rule:
+//   - authors always see private_payload
+//   - paid buyers see private_payload for pay_to_reveal signals
+//   - everyone else gets only the locked teaser/public payload
 signalRoutes.get("/channels/:id/signals", async (c) => {
   let me: string;
   try { me = await withAuth(c); } catch (e) { return authError(c, e); }
@@ -521,8 +528,11 @@ signalRoutes.get("/channels/:id/signals", async (c) => {
         WHERE s.channel_id = ${channelId}
         ORDER BY s.created_at DESC LIMIT ${limit}
       `;
+  const purchasedSignalIds = await loadPaidPurchaseSignalIdsForViewer(me, rows);
   for (const row of rows) {
-    row.payload = clipSignalPayloadForViewer(row.payload, me, row.from_address);
+    row.payload = clipSignalPayloadForViewer(row.payload, me, row.from_address, {
+      hasPaidPurchase: purchasedSignalIds.has(row.signal_id),
+    });
   }
   return c.json({ signals: rows });
 });
@@ -661,7 +671,7 @@ signalRoutes.get("/channels/:id/signals/stream", async (c) => {
 // Response: { events: [...], signals: [...] }
 // `events` = unified timeline (signals + reactions interleaved by time).
 // `signals` = same as `events` (backward-compat alias — older CLIs read this).
-// Paid-signal rule: signal rows are clipped per viewer before truncation.
+// Paid-signal rule: signal rows are projected per viewer before truncation.
 signalRoutes.get("/signals/feed", async (c) => {
   let me: string;
   try { me = await withAuth(c); } catch (e) { return authError(c, e); }
@@ -755,9 +765,15 @@ signalRoutes.get("/signals/feed", async (c) => {
   // S5: cap each row's payload so feed bootstrap stays bounded even if
   // a malicious peer pushed 64KB messages. Original stays in DB; clients
   // wanting the full viewer-visible row can fetch via /channels/{id}/signals.
+  const purchasedSignalIds = await loadPaidPurchaseSignalIdsForViewer(
+    me,
+    rows.filter((r) => r.kind === "signal"),
+  );
   for (const r of rows) {
     const payload = r.kind === "signal"
-      ? clipSignalPayloadForViewer(r.payload, me, r.from_address)
+      ? clipSignalPayloadForViewer(r.payload, me, r.from_address, {
+          hasPaidPurchase: typeof r.signal_id === "string" && purchasedSignalIds.has(r.signal_id),
+        })
       : r.payload;
     r.payload = truncatePayloadForFeed(payload);
   }

@@ -21,8 +21,10 @@ export async function deliverWebhook(
   if (!rows.length) return;
   const { webhook_url, webhook_secret } = rows[0]!;
 
-  // Webhook delivery is also an API egress path; paid signals must be clipped
-  // with the same viewer-specific rule as feed/SSE responses.
+  // Webhook delivery is also an API egress path; paid signals must follow the
+  // same viewer-specific rule as feed/SSE responses. For newly-pushed signals
+  // that means author/full vs recipient/locked teaser — historical unlocks are
+  // handled by the read paths that can consult purchases.
   const clippedEvent =
     event.kind === "signal" && typeof event.from_address === "string"
       ? clipSignalEventForViewer(event as any, address)
@@ -57,7 +59,7 @@ export async function deliverToChannelMembers(
       AND i.webhook_url IS NOT NULL
   `;
   for (const m of members) {
-    // Each recipient gets a payload clipped for that recipient's address.
+    // Each recipient gets the same per-viewer projection used on live SSE.
     const clippedEvent =
       event.kind === "signal" && typeof event.from_address === "string"
         ? clipSignalEventForViewer(event as any, m.address)

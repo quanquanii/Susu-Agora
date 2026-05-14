@@ -233,7 +233,7 @@ susu feed -f           # 实时信息流，底部带常驻仓位栏
 
 ### Mock Buy（Step 3）
 
-Step 3 新增了 mock purchase 记录，但**仍然不会解锁** `private_payload`：
+Step 3 新增了 mock purchase 记录；Step 4 起，`status="paid"` 的 purchase 会解锁 `pay_to_reveal` 信号的 `private_payload`：
 
 - CLI 命令：`susu buy <signal_id>`
 - 后端接口：`POST /api/purchases`
@@ -242,7 +242,11 @@ Step 3 新增了 mock purchase 记录，但**仍然不会解锁** `private_paylo
   - `status="paid"`
   - `tx_hash="mock_tx_*"`
   - 同一个 `signal_id + buyer_handle` 幂等，重复购买返回已有 purchase
-- 安全模型不变：购买后非作者依然只看到 `public_payload`；真正解锁留到 Step 4
+- Step 4 读侧解锁规则：
+  - 作者永远能看到完整 payload
+  - `status="paid"` 的买家能看到完整 payload
+  - `pending` / `failed` / `refunded` 不解锁
+  - 未购买成员仍然只看到 `public_payload`
 
 ### 自动归一化
 

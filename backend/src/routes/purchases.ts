@@ -3,7 +3,7 @@
 // Scope:
 //   - records a purchase row in Postgres
 //   - enforces basic paid-signal validation + idempotency
-//   - does NOT unlock private_payload yet; Step 4 will wire read-side access
+//   - Step 4 read paths use status='paid' rows here to unlock private_payload
 
 import { Hono } from "hono";
 import { sql } from "../db.ts";

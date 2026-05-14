@@ -641,7 +641,7 @@ describeE2E("Susurration E2E (D7+D13)", () => {
     }
   });
 
-  test("paid signal payloads store private data but clip it for non-authors in channel log and feed", async () => {
+  test("paid signal payloads store private data and keep non-buyers locked in channel log and feed", async () => {
     const wA = makeWallet(); const tA = await login(wA);
     const wB = makeWallet(); const tB = await login(wB);
     await register(tA, uname("pa"));
@@ -680,6 +680,8 @@ describeE2E("Susurration E2E (D7+D13)", () => {
     expect(authorChannelSignals.status).toBe(200);
     const authorChannelBody = await authorChannelSignals.json() as any;
     expect(authorChannelBody.signals[0].payload.private_payload.note).toBe("private edge");
+    expect(authorChannelBody.signals[0].payload.viewer_role).toBe("author");
+    expect(authorChannelBody.signals[0].payload.purchased).toBe(false);
 
     const viewerChannelSignals = await app.fetch(new Request(`http://test/api/channels/${channel_id}/signals`, {
       headers: authHeaders(tB),
@@ -688,6 +690,8 @@ describeE2E("Susurration E2E (D7+D13)", () => {
     const viewerChannelBody = await viewerChannelSignals.json() as any;
     expect(viewerChannelBody.signals[0].payload).toEqual({
       locked: true,
+      purchased: false,
+      viewer_role: "locked",
       price: "25",
       currency: "USD",
       unlock_policy: "pay_to_reveal",
@@ -702,6 +706,7 @@ describeE2E("Susurration E2E (D7+D13)", () => {
     expect(authorFeed.status).toBe(200);
     const authorFeedBody = await authorFeed.json() as any;
     expect(authorFeedBody.events[0].payload.private_payload.note).toBe("private edge");
+    expect(authorFeedBody.events[0].payload.viewer_role).toBe("author");
 
     const viewerFeed = await app.fetch(new Request("http://test/api/signals/feed", {
       headers: authHeaders(tB),
@@ -710,6 +715,8 @@ describeE2E("Susurration E2E (D7+D13)", () => {
     const viewerFeedBody = await viewerFeed.json() as any;
     expect(viewerFeedBody.events[0].payload).toEqual({
       locked: true,
+      purchased: false,
+      viewer_role: "locked",
       price: "25",
       currency: "USD",
       unlock_policy: "pay_to_reveal",
@@ -719,7 +726,157 @@ describeE2E("Susurration E2E (D7+D13)", () => {
     expect(viewerFeedBody.events[0].payload.private_payload).toBeUndefined();
   });
 
-  test("mock buy: creates one paid purchase and does not unlock private_payload", async () => {
+  test("pay-to-reveal: paid buyers unlock private_payload while authors always keep access", async () => {
+    await sqlMod.sql`TRUNCATE purchases, register_ips RESTART IDENTITY`;
+    const wA = makeWallet(); const tA = await login(wA);
+    const wB = makeWallet(); const tB = await login(wB);
+    const aU = uname("pta"); await register(tA, aU);
+    const bU = uname("ptb"); await register(tB, bU);
+    await sqlMod.sql`UPDATE identities SET auto_accept_friends = true WHERE address = ${wB.address}`;
+    const add = await app.fetch(new Request("http://test/api/friends/add", {
+      method: "POST", headers: authHeaders(tA), body: JSON.stringify({ username: bU }),
+    }));
+    const { channel_id } = await add.json() as any;
+
+    const lockedPayload = {
+      type: "trade_entry",
+      locked: true,
+      price: "0.01",
+      currency: "USDC",
+      unlock_policy: "pay_to_reveal",
+      expires_at: "2026-12-31T00:00:00.000Z",
+      public_payload: {
+        token: "BTCUSDT",
+        direction: "long",
+        summary: "BTC breakout retest",
+      },
+      private_payload: {
+        entry_price: 65000,
+        stop_loss: 63500,
+        take_profit: 69500,
+        leverage: 2,
+        reason: "R:R about 3:1",
+      },
+    };
+
+    const push = await app.fetch(new Request(`http://test/api/channels/${channel_id}/signals`, {
+      method: "POST", headers: authHeaders(tA), body: JSON.stringify(lockedPayload),
+    }));
+    if (!requireRate(0)) {
+      expect(push.status).toBe(402);
+      return;
+    }
+    expect(push.status).toBe(201);
+    const createdSignal = await push.json() as any;
+
+    const beforeBuyFeed = await app.fetch(new Request("http://test/api/signals/feed", {
+      headers: authHeaders(tB),
+    }));
+    expect(beforeBuyFeed.status).toBe(200);
+    const beforeBuyBody = await beforeBuyFeed.json() as any;
+    expect(beforeBuyBody.events[0].payload.viewer_role).toBe("locked");
+    expect(beforeBuyBody.events[0].payload.purchased).toBe(false);
+    expect(beforeBuyBody.events[0].payload.public_payload.summary).toBe("BTC breakout retest");
+    expect(beforeBuyBody.events[0].payload.private_payload).toBeUndefined();
+
+    const buy = await app.fetch(new Request("http://test/api/purchases", {
+      method: "POST", headers: authHeaders(tB), body: JSON.stringify({ signal_id: createdSignal.signal_id }),
+    }));
+    expect(buy.status).toBe(201);
+
+    const afterBuyFeed = await app.fetch(new Request("http://test/api/signals/feed", {
+      headers: authHeaders(tB),
+    }));
+    expect(afterBuyFeed.status).toBe(200);
+    const afterBuyBody = await afterBuyFeed.json() as any;
+    expect(afterBuyBody.events[0].payload.viewer_role).toBe("buyer");
+    expect(afterBuyBody.events[0].payload.purchased).toBe(true);
+    expect(afterBuyBody.events[0].payload.private_payload.entry_price).toBe(65000);
+    expect(afterBuyBody.events[0].payload.private_payload.stop_loss).toBe(63500);
+    expect(afterBuyBody.events[0].payload.private_payload.take_profit).toBe(69500);
+    expect(afterBuyBody.events[0].payload.private_payload.leverage).toBe(2);
+    expect(afterBuyBody.events[0].payload.private_payload.reason).toBe("R:R about 3:1");
+
+    const authorFeed = await app.fetch(new Request("http://test/api/signals/feed", {
+      headers: authHeaders(tA),
+    }));
+    expect(authorFeed.status).toBe(200);
+    const authorFeedBody = await authorFeed.json() as any;
+    expect(authorFeedBody.events[0].payload.viewer_role).toBe("author");
+    expect(authorFeedBody.events[0].payload.private_payload.entry_price).toBe(65000);
+  });
+
+  test("pay-to-reveal: only status=paid unlocks private_payload", async () => {
+    await sqlMod.sql`TRUNCATE purchases, register_ips RESTART IDENTITY`;
+    const wA = makeWallet(); const tA = await login(wA);
+    const wB = makeWallet(); const tB = await login(wB);
+    const aU = uname("psa"); await register(tA, aU);
+    const bU = uname("psb"); await register(tB, bU);
+    await sqlMod.sql`UPDATE identities SET auto_accept_friends = true WHERE address = ${wB.address}`;
+    const add = await app.fetch(new Request("http://test/api/friends/add", {
+      method: "POST", headers: authHeaders(tA), body: JSON.stringify({ username: bU }),
+    }));
+    const { channel_id } = await add.json() as any;
+
+    const createLockedSignal = async (summary: string) => {
+      const resp = await app.fetch(new Request(`http://test/api/channels/${channel_id}/signals`, {
+        method: "POST",
+        headers: authHeaders(tA),
+        body: JSON.stringify({
+          locked: true,
+          price: "0.01",
+          currency: "USDC",
+          unlock_policy: "pay_to_reveal",
+          public_payload: { summary },
+          private_payload: { note: `secret:${summary}` },
+        }),
+      }));
+      expect(resp.status).toBe(201);
+      return await resp.json() as any;
+    };
+
+    if (!requireRate(0)) {
+      const paidModePush = await app.fetch(new Request(`http://test/api/channels/${channel_id}/signals`, {
+        method: "POST", headers: authHeaders(tA), body: JSON.stringify({ type: "trade_entry" }),
+      }));
+      expect(paidModePush.status).toBe(402);
+      return;
+    }
+
+    for (const status of ["pending", "failed", "refunded"] as const) {
+      const signal = await createLockedSignal(`status-${status}`);
+      await sqlMod.sql`
+        INSERT INTO purchases(signal_id, buyer_handle, seller_handle, amount, currency, status, tx_hash)
+        VALUES (
+          ${signal.signal_id},
+          ${`@${bU}`},
+          ${`@${aU}`},
+          '0.01',
+          'USDC',
+          ${status},
+          ${`mock_tx_${status}`}
+        )
+      `;
+    }
+
+    const viewerSignals = await app.fetch(new Request(`http://test/api/channels/${channel_id}/signals`, {
+      headers: authHeaders(tB),
+    }));
+    expect(viewerSignals.status).toBe(200);
+    const viewerSignalsBody = await viewerSignals.json() as any;
+    let checked = 0;
+    for (const row of viewerSignalsBody.signals) {
+      if (row.payload?.public_payload?.summary?.startsWith?.("status-")) {
+        checked += 1;
+        expect(row.payload.viewer_role).toBe("locked");
+        expect(row.payload.purchased).toBe(false);
+        expect(row.payload.private_payload).toBeUndefined();
+      }
+    }
+    expect(checked).toBe(3);
+  });
+
+  test("mock buy: creates one paid purchase and remains idempotent", async () => {
     await sqlMod.sql`TRUNCATE purchases, register_ips RESTART IDENTITY`;
     const wA = makeWallet(); const tA = await login(wA);
     const wB = makeWallet(); const tB = await login(wB);
@@ -791,14 +948,6 @@ describeE2E("Susurration E2E (D7+D13)", () => {
       WHERE signal_id = ${createdSignal.signal_id} AND buyer_handle = ${`@${bU}`}
     `;
     expect(purchaseCount?.c).toBe(1);
-
-    const viewerFeed = await app.fetch(new Request("http://test/api/signals/feed", {
-      headers: authHeaders(tB),
-    }));
-    expect(viewerFeed.status).toBe(200);
-    const viewerFeedBody = await viewerFeed.json() as any;
-    expect(viewerFeedBody.events[0].payload.public_payload.summary).toBe("BTC breakout retest");
-    expect(viewerFeedBody.events[0].payload.private_payload).toBeUndefined();
   });
 
   test("mock buy: rejects author and missing signals", async () => {
