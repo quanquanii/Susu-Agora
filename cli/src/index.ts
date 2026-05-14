@@ -262,7 +262,7 @@ async function cmdJoin(args: string[]): Promise<number> {
     }
 
     if (!llmKey) {
-      const keyInput = await promptLine("  LLM API key (OpenAI or Anthropic): ");
+      const keyInput = await promptLine("  LLM API key (OpenAI, Anthropic, or Groq): ");
       if (!keyInput) { process.stderr.write("cancelled\n"); return 1; }
       llmKey = keyInput;
     }
@@ -284,7 +284,7 @@ async function cmdJoin(args: string[]): Promise<number> {
   }
 
   if (!llmKey) {
-    process.stderr.write("--llm-key is required (your OpenAI or Anthropic API key)\n");
+    process.stderr.write("--llm-key is required (your OpenAI, Anthropic, or Groq API key)\n");
     return 1;
   }
 
@@ -373,6 +373,9 @@ async function cmdJoin(args: string[]): Promise<number> {
   if (llmKey.startsWith("sk-ant-")) {
     provider = "anthropic";
     model = "claude-sonnet-4-20250514";
+  } else if (llmKey.startsWith("gsk_")) {
+    provider = "groq";
+    model = "openai/gpt-oss-20b";
   }
 
   const fs = await import("node:fs/promises");

@@ -36,7 +36,7 @@ import { unlinkSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
 import {
-  AnthropicProvider, OpenAIProvider,
+  AnthropicProvider, GroqProvider, OpenAIProvider,
   type LLMProvider, type AgentContext, type AgentDecision,
 } from "./llm.ts";
 import { DecisionLog } from "./decision_log.ts";
@@ -47,6 +47,11 @@ import {
   reportClientError,
   type SusuClientConfig,
 } from "./susu_actions.ts";
+// Bun resolves JSON imports when building the published CLI bundle.
+// @ts-ignore
+import pkg from "../package.json";
+
+const DAEMON_VERSION: string = pkg.version ?? "unknown";
 
 // ── Config ───────────────────────────────────────────────────────────────
 
@@ -54,10 +59,10 @@ interface DaemonConfig {
   api_url: string;
   token: string;
   llm: {
-    provider: "anthropic" | "openai";
+    provider: "anthropic" | "openai" | "groq";
     api_key: string;
     model: string;
-    /** Custom base URL for OpenAI-compatible APIs (DeepSeek, Gemini, Ollama, etc.) */
+    /** Custom base URL for OpenAI-compatible APIs routed through the OpenAI provider. */
     base_url?: string;
   };
   agent: {
@@ -133,7 +138,7 @@ Config file shape (.json):
     "api_url": "https://susurration.xyz/api",
     "token": "<bearer from susu login>",
     "llm": {
-      "provider": "anthropic" | "openai",
+      "provider": "anthropic" | "openai" | "groq",
       "api_key": "<your llm api key>",
       "model": "claude-sonnet-4-6" | "gpt-5" | ...
     },
@@ -146,6 +151,10 @@ Config file shape (.json):
     "dry_run_pushes": true,
     "paper_trading": { "enabled": true }
   }
+
+Groq note:
+  - Prefer setting GROQ_API_KEY in the environment instead of storing it in config.
+  - Example: "provider": "groq", "model": "openai/gpt-oss-20b"
 
 paper_trading (default: enabled):
   Built-in paper trading. On react +1 with size_factor >= 0.5, opens a
@@ -246,9 +255,24 @@ async function main(): Promise<number> {
   const cfg = await loadConfig(args);
   const susu: SusuClientConfig = { api_url: cfg.api_url, token: cfg.token };
 
-  const provider: LLMProvider = cfg.llm.provider === "openai"
-    ? new OpenAIProvider(cfg.llm.api_key, cfg.llm.model, cfg.llm.base_url)
-    : new AnthropicProvider(cfg.llm.api_key, cfg.llm.model);
+  let provider: LLMProvider;
+  switch (cfg.llm.provider) {
+    case "openai":
+      provider = new OpenAIProvider(cfg.llm.api_key, cfg.llm.model, cfg.llm.base_url);
+      break;
+    case "groq": {
+      const apiKey = cfg.llm.api_key || process.env.GROQ_API_KEY;
+      if (!apiKey) {
+        throw new Error("Missing Groq API key. Set llm.api_key or GROQ_API_KEY.");
+      }
+      provider = new GroqProvider(apiKey, cfg.llm.model);
+      break;
+    }
+    case "anthropic":
+    default:
+      provider = new AnthropicProvider(cfg.llm.api_key, cfg.llm.model);
+      break;
+  }
 
   const log = new DecisionLog(cfg.decision_log_path);
   const limiter = new MinuteRateLimiter(cfg.agent.max_calls_per_minute!);

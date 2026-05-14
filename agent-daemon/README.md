@@ -73,6 +73,22 @@ Same shape for all three modes. Save as `agent.config.json`:
 }
 ```
 
+Groq example:
+
+```json
+{
+  "llm": {
+    "provider": "groq",
+    "model": "openai/gpt-oss-20b",
+    "api_key": ""
+  }
+}
+```
+
+Prefer setting `GROQ_API_KEY` in the environment instead of writing the key
+into the config file. Leave `llm.api_key` empty if you want the daemon to
+read `process.env.GROQ_API_KEY`.
+
 ---
 
 ## Path A — Long-running on your laptop

@@ -124,7 +124,7 @@ const TOOLS = [
       type: "object",
       properties: {
         username: { type: "string", description: "@handle (5-20 chars, lowercase, permanent)" },
-        llm_key: { type: "string", description: "User's OpenAI (sk-proj-...) or Anthropic (sk-ant-...) API key" },
+        llm_key: { type: "string", description: "User's OpenAI (sk-proj-...), Anthropic (sk-ant-...), or Groq (gsk_...) API key" },
       },
       required: ["username", "llm_key"],
       additionalProperties: false,
@@ -428,6 +428,9 @@ async function main() {
           if (llmKey.startsWith("sk-ant-")) {
             provider = "anthropic";
             model = "claude-sonnet-4-20250514";
+          } else if (llmKey.startsWith("gsk_")) {
+            provider = "groq";
+            model = "openai/gpt-oss-20b";
           }
 
           const { writeFileSync, mkdirSync } = await import("node:fs");

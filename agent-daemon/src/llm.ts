@@ -1,35 +1,35 @@
-// LLM provider abstraction. Two providers shipped: Anthropic (default) and
-// OpenAI. Adding a third just means implementing `LLMProvider`.
+// LLM 提供方抽象。当前内置三个提供方：Anthropic（默认）、
+// OpenAI 和 Groq。要增加新的提供方，只需要实现 `LLMProvider`。
 //
-// Why not just LiteLLM / a generic SDK: the agent-daemon makes one well-
-// shaped call per incoming signal — we know exactly what tools we want to
-// expose. A thin native-SDK wrapper is shorter, easier to debug, and avoids
-// pulling in a heavy abstraction layer for two providers.
+// 为什么不用 LiteLLM / 通用 SDK：agent-daemon 会针对每个信号做一次
+// 结构固定的调用，我们很清楚要暴露哪些工具。使用轻量的原生 SDK 包装
+// 更短、更容易调试，也避免为了少数几个提供方引入一层厚抽象。
 
 import Anthropic from "@anthropic-ai/sdk";
+import Groq from "groq-sdk";
 import OpenAI from "openai";
 
-// ── Domain types — what the daemon asks for and what it gets back ────────
+// ── 领域类型：daemon 请求什么，以及返回什么 ─────────────────────────
 
-/** What the daemon knows about an incoming event for the LLM to evaluate. */
+/** daemon 交给 LLM 评估时，对传入事件的认知信息。 */
 export interface AgentContext {
-  /** Recent N events on the channel (newest last), JSON-serialized. */
+  /** 频道最近的 N 条事件（按时间从旧到新），已序列化为 JSON。 */
   recent_events: unknown[];
-  /** Channel display label (peer @handle for 1on1, group name for group). */
+  /** 频道显示名（1 对 1 时是对方 @handle，群组时是群名）。 */
   channel_label: string;
-  /** The triggering event itself (separated so prompt can highlight it). */
+  /** 触发本次决策的事件本身（单独传入，方便 prompt 强调）。 */
   triggering_event: unknown;
-  /** Caller's own @handle so the LLM doesn't react to its own pushes. */
+  /** 调用者自己的 @handle，避免 LLM 对自己的推送做反应。 */
   my_handle: string | null;
 }
 
-/** Decision the LLM returns. The daemon executes whichever shape it gets. */
+/** LLM 返回的决策。daemon 会执行拿到的任意一种结构。 */
 export type AgentDecision =
   | { kind: "noop"; reason: string }
   | { kind: "react"; signal_id: string; payload: Record<string, unknown>; reason: string }
   | { kind: "push"; channel_id: string; payload: Record<string, unknown>; reason: string };
 
-/** Token + latency stats for the decision log. */
+/** 供决策日志使用的 token 和延迟统计信息。 */
 export interface CallStats {
   provider: string;
   model: string;
@@ -42,7 +42,7 @@ export interface LLMProvider {
   decide(ctx: AgentContext, systemPrompt: string): Promise<{ decision: AgentDecision; stats: CallStats }>;
 }
 
-// ── Tool schema — same JSON-Schema shape works for both providers ────────
+// ── 工具 schema：多个提供方都能复用同一套 JSON Schema ────────────────
 
 const TOOL_NOOP = {
   name: "do_nothing",
@@ -112,6 +112,68 @@ const TOOL_PUSH = {
   },
 };
 
+const OPENAI_COMPAT_TOOLS = [
+  { type: "function" as const, function: TOOL_NOOP },
+  { type: "function" as const, function: TOOL_REACT },
+  { type: "function" as const, function: TOOL_PUSH },
+];
+
+function buildUserText(ctx: AgentContext): string {
+  return JSON.stringify(
+    {
+      my_handle: ctx.my_handle,
+      channel_label: ctx.channel_label,
+      recent_events: ctx.recent_events,
+      triggering_event: ctx.triggering_event,
+      instructions:
+        "Choose exactly ONE tool call: do_nothing / react_to_signal / push_signal. Be conservative — prefer do_nothing if uncertain.",
+    },
+    null,
+    2,
+  );
+}
+
+async function decideWithOpenAICompatibleClient(
+  createChatCompletion: (args: any) => Promise<any>,
+  providerName: "openai" | "groq",
+  model: string,
+  ctx: AgentContext,
+  systemPrompt: string,
+): Promise<{ decision: AgentDecision; stats: CallStats }> {
+  const startedAt = Date.now();
+  const userText = buildUserText(ctx);
+
+  const resp = await createChatCompletion({
+    model,
+    tools: OPENAI_COMPAT_TOOLS,
+    tool_choice: "required",
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userText },
+    ],
+  });
+
+  const stats: CallStats = {
+    provider: providerName,
+    model,
+    input_tokens: resp.usage?.prompt_tokens ?? 0,
+    output_tokens: resp.usage?.completion_tokens ?? 0,
+    latency_ms: Date.now() - startedAt,
+  };
+
+  const tc = resp.choices?.[0]?.message?.tool_calls?.[0];
+  if (!tc) {
+    return {
+      decision: { kind: "noop", reason: "LLM returned no tool call" } as AgentDecision,
+      stats,
+    };
+  }
+
+  let parsedArgs: any = {};
+  try { parsedArgs = JSON.parse(tc.function.arguments ?? "{}"); } catch { /* keep {} */ }
+  return { decision: blockToDecision(tc.function.name, parsedArgs), stats };
+}
+
 // ── Anthropic ────────────────────────────────────────────────────────────
 
 export class AnthropicProvider implements LLMProvider {
@@ -122,18 +184,7 @@ export class AnthropicProvider implements LLMProvider {
 
   async decide(ctx: AgentContext, systemPrompt: string) {
     const startedAt = Date.now();
-    const userText = JSON.stringify(
-      {
-        my_handle: ctx.my_handle,
-        channel_label: ctx.channel_label,
-        recent_events: ctx.recent_events,
-        triggering_event: ctx.triggering_event,
-        instructions:
-          "Choose exactly ONE tool call: do_nothing / react_to_signal / push_signal. Be conservative — prefer do_nothing if uncertain.",
-      },
-      null,
-      2,
-    );
+    const userText = buildUserText(ctx);
 
     const resp = await this.client.messages.create({
       model: this.model,
@@ -156,13 +207,13 @@ export class AnthropicProvider implements LLMProvider {
       latency_ms: Date.now() - startedAt,
     };
 
-    // Find the first tool_use block.
+    // 找到第一个 tool_use block。
     for (const block of resp.content) {
       if (block.type === "tool_use") {
         return { decision: blockToDecision(block.name, block.input as any), stats };
       }
     }
-    // No tool call → fallback noop.
+    // 没有工具调用时，回退为 noop。
     return {
       decision: { kind: "noop", reason: "LLM returned no tool call" } as AgentDecision,
       stats,
@@ -179,56 +230,36 @@ export class OpenAIProvider implements LLMProvider {
   }
 
   async decide(ctx: AgentContext, systemPrompt: string) {
-    const startedAt = Date.now();
-    const userText = JSON.stringify(
-      {
-        my_handle: ctx.my_handle,
-        channel_label: ctx.channel_label,
-        recent_events: ctx.recent_events,
-        triggering_event: ctx.triggering_event,
-        instructions:
-          "Choose exactly ONE tool call: do_nothing / react_to_signal / push_signal. Be conservative — prefer do_nothing if uncertain.",
-      },
-      null,
-      2,
+    return decideWithOpenAICompatibleClient(
+      this.client.chat.completions.create.bind(this.client.chat.completions),
+      "openai",
+      this.model,
+      ctx,
+      systemPrompt,
     );
-
-    const resp = await this.client.chat.completions.create({
-      model: this.model,
-      tools: [
-        { type: "function", function: TOOL_NOOP },
-        { type: "function", function: TOOL_REACT },
-        { type: "function", function: TOOL_PUSH },
-      ],
-      tool_choice: "required",
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userText },
-      ],
-    });
-
-    const stats: CallStats = {
-      provider: "openai",
-      model: this.model,
-      input_tokens: resp.usage?.prompt_tokens ?? 0,
-      output_tokens: resp.usage?.completion_tokens ?? 0,
-      latency_ms: Date.now() - startedAt,
-    };
-
-    const tc = resp.choices[0]?.message?.tool_calls?.[0];
-    if (!tc) {
-      return {
-        decision: { kind: "noop", reason: "LLM returned no tool call" } as AgentDecision,
-        stats,
-      };
-    }
-    let parsedArgs: any = {};
-    try { parsedArgs = JSON.parse(tc.function.arguments); } catch { /* keep {} */ }
-    return { decision: blockToDecision(tc.function.name, parsedArgs), stats };
   }
 }
 
-// ── Tool result → AgentDecision ──────────────────────────────────────────
+// ── Groq ─────────────────────────────────────────────────────────────────
+
+export class GroqProvider implements LLMProvider {
+  private client: Groq;
+  constructor(apiKey: string, private model: string) {
+    this.client = new Groq({ apiKey });
+  }
+
+  async decide(ctx: AgentContext, systemPrompt: string) {
+    return decideWithOpenAICompatibleClient(
+      this.client.chat.completions.create.bind(this.client.chat.completions),
+      "groq",
+      this.model,
+      ctx,
+      systemPrompt,
+    );
+  }
+}
+
+// ── 工具结果 → AgentDecision ──────────────────────────────────────────
 
 function blockToDecision(toolName: string, input: any): AgentDecision {
   switch (toolName) {
