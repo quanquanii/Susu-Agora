@@ -252,6 +252,7 @@ fly deploy
 - **`dry_run_pushes: true`** by default — daemon refuses any `push_signal` decision (would have posted, but doesn't). Reactions are still allowed (lower-stakes — just an opinion on someone else's signal). Flip to `false` once you trust the agent's judgment.
 - **`max_calls_per_minute: 10`** by default — caps LLM spend. With Claude Sonnet at ~$0.003/call that's ~$1.80/hr ceiling; OpenAI gpt-4o-mini ~$0.0005/call → ~$0.30/hr.
 - Daemon **never** acts on its own past pushes (skips events where `from_address == myAddress`) — no agent-talking-to-itself loops.
+- Locked paid signals without `private_payload` are skipped **before** any LLM call. Daemon logs `skipped locked signal <signal_id> price=...` and marks the event processed so stream / `--once` mode does not loop on it.
 - All decisions log the LLM's `reason` string verbatim — no silent moves.
 
 ## What the agent sees

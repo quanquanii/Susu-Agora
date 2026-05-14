@@ -45,6 +45,11 @@ export class DecisionLog {
     if (this.filePath) await this.appendToFile(entry);
   }
 
+  async logSkipped(ctx: AgentContext, reason: string): Promise<void> {
+    this.printSkippedToTerminal(ctx, reason);
+    if (this.filePath) await this.appendSkippedToFile(ctx, reason);
+  }
+
   private printToTerminal(e: LogEntry): void {
     const t = dim(fmtTime());
     const triggerPreview = previewEvent(e.ctx.triggering_event);
@@ -77,6 +82,27 @@ export class DecisionLog {
       stats: e.stats,
       result: e.result,
       error: e.error,
+    }) + "\n";
+    try { await appendFile(this.filePath!, line, "utf8"); } catch {
+      // Don't crash the daemon over log file issues.
+    }
+  }
+
+  private printSkippedToTerminal(ctx: AgentContext, reason: string): void {
+    const t = dim(fmtTime());
+    process.stdout.write(`${t}  ${color(ctx.channel_label, CYAN)}\n`);
+    process.stdout.write(`  ${dim("⌥ skipped:")} ${reason}\n\n`);
+  }
+
+  private async appendSkippedToFile(ctx: AgentContext, reason: string): Promise<void> {
+    const line = JSON.stringify({
+      ts: new Date().toISOString(),
+      channel_label: ctx.channel_label,
+      triggering_event: ctx.triggering_event,
+      recent_event_count: ctx.recent_events.length,
+      decision: { kind: "noop", reason },
+      skipped: true,
+      skip_reason: reason,
     }) + "\n";
     try { await appendFile(this.filePath!, line, "utf8"); } catch {
       // Don't crash the daemon over log file issues.

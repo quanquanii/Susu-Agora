@@ -42,6 +42,7 @@ import {
 import { DecisionLog } from "./decision_log.ts";
 import { PaperTrader } from "./paper_trading.ts";
 import { normalizeSignalPayload } from "./normalize.ts";
+import { getLockedSignalSkipInfo } from "./locked_signal.ts";
 import {
   pushSignal, pushReaction, recentSignals, feedSince,
   reportClientError,
@@ -566,7 +567,7 @@ async function runOneStream(
 
 const SIGNAL_EXPIRY_MS = 60 * 60 * 1000; // 1 hour
 
-async function handleEvent(
+export async function handleEvent(
   evt: any,
   susu: SusuClientConfig,
   provider: LLMProvider,
@@ -589,6 +590,23 @@ async function handleEvent(
     }
   }
 
+  const channelId = evt.channel_id;
+  const channelLabel = evt.channel_name ?? (evt.peer?.username ? `@${evt.peer.username}` : channelId.slice(0, 8));
+  const lockedSkip = getLockedSignalSkipInfo(evt);
+  if (lockedSkip) {
+    const priceBits = [lockedSkip.price, lockedSkip.currency].filter(Boolean).join(" ");
+    const suffix = priceBits ? ` price=${priceBits}` : "";
+    const signalId = lockedSkip.signal_id || evt.signal_id || "?";
+    process.stderr.write(`[daemon] skipped locked signal ${signalId}${suffix}\n`);
+    await log.logSkipped({
+      recent_events: [],
+      channel_label: channelLabel,
+      triggering_event: evt,
+      my_handle: null,
+    }, `locked signal ${signalId} not unlocked`);
+    return;
+  }
+
   if (!limiter.tryConsume()) {
     process.stderr.write(`[daemon] rate-limited (>${cfg.agent.max_calls_per_minute}/min); skipping event\n`);
     return;
@@ -601,9 +619,6 @@ async function handleEvent(
       process.stderr.write(`[daemon] signal normalize warn: ${w}\n`);
     }
   }
-
-  const channelId = evt.channel_id;
-  const channelLabel = evt.channel_name ?? (evt.peer?.username ? `@${evt.peer.username}` : channelId.slice(0, 8));
 
   // Pull recent context for the LLM. Bounded by cfg.history_per_channel.
   let history: any[] = [];
@@ -736,7 +751,9 @@ async function handleEvent(
   }
 }
 
-main().then((code) => process.exit(code)).catch((err) => {
-  process.stderr.write(`[daemon] fatal: ${(err as Error)?.message ?? err}\n`);
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().then((code) => process.exit(code)).catch((err) => {
+    process.stderr.write(`[daemon] fatal: ${(err as Error)?.message ?? err}\n`);
+    process.exit(1);
+  });
+}
