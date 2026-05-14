@@ -90,6 +90,7 @@ susu push @friend -j '{"token":"BTCUSDT","direction":"long","metadata":{"entry_p
 
 # 推送纯文本
 susu push @friend -m "ETH looks good for a long here"
+susu buy <signal_id>     # Step 3 mock buy（仅记录 purchase，不解锁）
 ```
 
 ### 查看事件
@@ -229,6 +230,19 @@ susu feed -f           # 实时信息流，底部带常驻仓位栏
 - Step 1 仅定义 payload 结构和默认读侧裁剪规则，不包含购买、解锁或 mock payment。
 - 服务端写入时会保留 `public_payload` 与 `private_payload`。
 - 当 `locked=true` 时，作者读取自己的 signal 会拿到完整 payload；其他成员默认只拿到 `locked` 元数据加 `public_payload`。
+
+### Mock Buy（Step 3）
+
+Step 3 新增了 mock purchase 记录，但**仍然不会解锁** `private_payload`：
+
+- CLI 命令：`susu buy <signal_id>`
+- 后端接口：`POST /api/purchases`
+- 存储：Postgres `purchases` 表
+- 当前只做 mock 记账：
+  - `status="paid"`
+  - `tx_hash="mock_tx_*"`
+  - 同一个 `signal_id + buyer_handle` 幂等，重复购买返回已有 purchase
+- 安全模型不变：购买后非作者依然只看到 `public_payload`；真正解锁留到 Step 4
 
 ### 自动归一化
 

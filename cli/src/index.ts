@@ -54,6 +54,7 @@ Group rules (free-form JSON; agents compose their own conventions)
 Messaging
   susu push <target> [-m TEXT | -j JSON] [-h] <target> = @handle (1-on-1) or <channel_id> (group)
                                               -h marks the message as from the human
+  susu buy <signal_id>                        Mock-buy a locked paid signal
   susu watch <target>                         Live-tail incoming messages (Ctrl-C exits)
   susu signals <target>                       Recent messages
   susu react <signal_id> [-m TEXT | -j JSON]  React to a message
@@ -131,6 +132,7 @@ async function main() {
     channel: cmdGroup, // alias for backward compat
     meta: cmdMeta,
     push: cmdPush,
+    buy: cmdBuy,
     watch: cmdWatch,
     signals: cmdSignals,
     react: cmdReact,
@@ -961,6 +963,45 @@ async function cmdPush(args: string[]): Promise<number> {
         `run \`susu approve\` (or open ${b.approve_again_url ?? "https://susurration.xyz/approve"}) to top up.\n`,
       );
       return 1;
+    }
+    throw e;
+  }
+}
+
+async function cmdBuy(args: string[]): Promise<number> {
+  const cfg = await loadConfig();
+  if (!cfg.token) { process.stderr.write("not logged in (run `susu login`)\n"); return 2; }
+  const signalId = args[0];
+  if (!signalId) { process.stderr.write("usage: susu buy <signal_id>\n"); return 1; }
+  try {
+    const out = await api<any>(cfg, "/purchases", {
+      method: "POST",
+      body: JSON.stringify({ signal_id: signalId }),
+    });
+    return printJsonOrTable(args, out, (o) => {
+      const lines = [
+        `purchase_id:   ${o.id}`,
+        `signal_id:     ${o.signal_id}`,
+        `buyer_handle:  ${o.buyer_handle}`,
+        `seller_handle: ${o.seller_handle}`,
+        `amount:        ${o.amount}`,
+        `currency:      ${o.currency}`,
+        `status:        ${o.already_purchased ? `${o.status} (already purchased)` : o.status}`,
+        `tx_hash:       ${o.tx_hash}`,
+        `created_at:    ${o.created_at}`,
+      ];
+      if (o.already_purchased) lines.push("already_purchased: true");
+      return lines.join("\n") + "\n";
+    });
+  } catch (e) {
+    if (e instanceof ApiError) {
+      const body = e.body ?? {};
+      const message =
+        typeof body?.message === "string" ? body.message
+          : typeof body?.error === "string" ? body.error
+            : e.message;
+      process.stderr.write(`error: ${message}\n`);
+      return e.status === 401 ? 2 : 1;
     }
     throw e;
   }

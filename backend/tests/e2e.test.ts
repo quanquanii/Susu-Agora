@@ -96,6 +96,7 @@ describeE2E("Susurration E2E (D7+D13)", () => {
     // below from migration 005 to keep the system / obscenity blocklist
     // available for the tests that depend on it.
     await sqlMod.sql`TRUNCATE
+      purchases,
       events, approval_cache, spender_rotations,
       friend_requests, friend_links,
       usage_log, kick_history, channel_ban_list,
@@ -716,6 +717,214 @@ describeE2E("Susurration E2E (D7+D13)", () => {
       public_payload: { teaser: "BTC scalp setup" },
     });
     expect(viewerFeedBody.events[0].payload.private_payload).toBeUndefined();
+  });
+
+  test("mock buy: creates one paid purchase and does not unlock private_payload", async () => {
+    await sqlMod.sql`TRUNCATE purchases, register_ips RESTART IDENTITY`;
+    const wA = makeWallet(); const tA = await login(wA);
+    const wB = makeWallet(); const tB = await login(wB);
+    const aU = uname("mba"); await register(tA, aU);
+    const bU = uname("mbb"); await register(tB, bU);
+    await sqlMod.sql`UPDATE identities SET auto_accept_friends = true WHERE address = ${wB.address}`;
+    const add = await app.fetch(new Request("http://test/api/friends/add", {
+      method: "POST", headers: authHeaders(tA), body: JSON.stringify({ username: bU }),
+    }));
+    const { channel_id } = await add.json() as any;
+
+    const lockedPayload = {
+      type: "trade_entry",
+      locked: true,
+      price: "0.01",
+      currency: "USDC",
+      unlock_policy: "pay_to_reveal",
+      expires_at: "2026-12-31T00:00:00.000Z",
+      public_payload: {
+        token: "BTCUSDT",
+        direction: "long",
+        summary: "BTC breakout retest",
+      },
+      private_payload: {
+        entry_price: 65000,
+        stop_loss: 63500,
+        take_profit: 69500,
+        leverage: 2,
+        reason: "R:R about 3:1",
+      },
+    };
+
+    const push = await app.fetch(new Request(`http://test/api/channels/${channel_id}/signals`, {
+      method: "POST", headers: authHeaders(tA), body: JSON.stringify(lockedPayload),
+    }));
+    if (!requireRate(0)) {
+      expect(push.status).toBe(402);
+      return;
+    }
+    expect(push.status).toBe(201);
+    const createdSignal = await push.json() as any;
+
+    const buy = await app.fetch(new Request("http://test/api/purchases", {
+      method: "POST", headers: authHeaders(tB), body: JSON.stringify({ signal_id: createdSignal.signal_id }),
+    }));
+    expect(buy.status).toBe(201);
+    const purchase = await buy.json() as any;
+    expect(purchase.signal_id).toBe(createdSignal.signal_id);
+    expect(purchase.buyer_handle).toBe(`@${bU}`);
+    expect(purchase.seller_handle).toBe(`@${aU}`);
+    expect(purchase.amount).toBe("0.01");
+    expect(purchase.currency).toBe("USDC");
+    expect(purchase.status).toBe("paid");
+    expect(purchase.tx_hash).toMatch(/^mock_tx_/);
+    expect(purchase.already_purchased).toBe(false);
+
+    const buyAgain = await app.fetch(new Request("http://test/api/purchases", {
+      method: "POST", headers: authHeaders(tB), body: JSON.stringify({ signal_id: createdSignal.signal_id }),
+    }));
+    expect(buyAgain.status).toBe(200);
+    const existing = await buyAgain.json() as any;
+    expect(existing.id).toBe(purchase.id);
+    expect(existing.tx_hash).toBe(purchase.tx_hash);
+    expect(existing.already_purchased).toBe(true);
+
+    const [purchaseCount] = await sqlMod.sql<{ c: number }[]>`
+      SELECT count(*)::int AS c
+      FROM purchases
+      WHERE signal_id = ${createdSignal.signal_id} AND buyer_handle = ${`@${bU}`}
+    `;
+    expect(purchaseCount?.c).toBe(1);
+
+    const viewerFeed = await app.fetch(new Request("http://test/api/signals/feed", {
+      headers: authHeaders(tB),
+    }));
+    expect(viewerFeed.status).toBe(200);
+    const viewerFeedBody = await viewerFeed.json() as any;
+    expect(viewerFeedBody.events[0].payload.public_payload.summary).toBe("BTC breakout retest");
+    expect(viewerFeedBody.events[0].payload.private_payload).toBeUndefined();
+  });
+
+  test("mock buy: rejects author and missing signals", async () => {
+    await sqlMod.sql`TRUNCATE purchases, register_ips RESTART IDENTITY`;
+    const wA = makeWallet(); const tA = await login(wA);
+    const wB = makeWallet(); const tB = await login(wB); void tB;
+    const aU = uname("mca"); await register(tA, aU);
+    await register(tB, uname("mcb"));
+
+    const create = await app.fetch(new Request("http://test/api/channels", {
+      method: "POST", headers: authHeaders(tA), body: JSON.stringify({ name: "mock-buy-own" }),
+    }));
+    expect(create.status).toBe(201);
+    const { channel_id } = await create.json() as any;
+
+    const push = await app.fetch(new Request(`http://test/api/channels/${channel_id}/signals`, {
+      method: "POST", headers: authHeaders(tA), body: JSON.stringify({
+        locked: true,
+        price: "1",
+        currency: "USDC",
+        unlock_policy: "pay_to_reveal",
+        public_payload: { summary: "self buy check" },
+        private_payload: { note: "still locked" },
+      }),
+    }));
+    if (!requireRate(0)) {
+      expect(push.status).toBe(402);
+      return;
+    }
+    expect(push.status).toBe(201);
+    const signal = await push.json() as any;
+
+    const ownBuy = await app.fetch(new Request("http://test/api/purchases", {
+      method: "POST", headers: authHeaders(tA), body: JSON.stringify({ signal_id: signal.signal_id }),
+    }));
+    expect(ownBuy.status).toBe(400);
+    expect((await ownBuy.json() as any).error).toBe("cannot_buy_own_signal");
+
+    const missing = await app.fetch(new Request("http://test/api/purchases", {
+      method: "POST", headers: authHeaders(tA), body: JSON.stringify({ signal_id: crypto.randomUUID() }),
+    }));
+    expect(missing.status).toBe(404);
+    expect((await missing.json() as any).error).toBe("signal_not_found");
+  });
+
+  test("mock buy: rejects unlocked, expired, unsupported, and malformed paid signals", async () => {
+    await sqlMod.sql`TRUNCATE purchases, register_ips RESTART IDENTITY`;
+    const wA = makeWallet(); const tA = await login(wA);
+    const wB = makeWallet(); const tB = await login(wB);
+    await register(tA, uname("mda"));
+    const bU = uname("mdb"); await register(tB, bU);
+    await sqlMod.sql`UPDATE identities SET auto_accept_friends = true WHERE address = ${wB.address}`;
+    const add = await app.fetch(new Request("http://test/api/friends/add", {
+      method: "POST", headers: authHeaders(tA), body: JSON.stringify({ username: bU }),
+    }));
+    const { channel_id } = await add.json() as any;
+
+    const createSignal = async (payload: any) => {
+      const resp = await app.fetch(new Request(`http://test/api/channels/${channel_id}/signals`, {
+        method: "POST", headers: authHeaders(tA), body: JSON.stringify(payload),
+      }));
+      expect(resp.status).toBe(201);
+      return await resp.json() as any;
+    };
+
+    if (!requireRate(0)) {
+      const paidModePush = await app.fetch(new Request(`http://test/api/channels/${channel_id}/signals`, {
+        method: "POST", headers: authHeaders(tA), body: JSON.stringify({ type: "trade_entry" }),
+      }));
+      expect(paidModePush.status).toBe(402);
+      return;
+    }
+
+    const plain = await createSignal({ type: "trade_entry", token: "ETHUSDT", direction: "long" });
+    const unlockedBuy = await app.fetch(new Request("http://test/api/purchases", {
+      method: "POST", headers: authHeaders(tB), body: JSON.stringify({ signal_id: plain.signal_id }),
+    }));
+    expect(unlockedBuy.status).toBe(400);
+    expect((await unlockedBuy.json() as any).error).toBe("purchase_not_required");
+
+    const expired = await createSignal({
+      locked: true,
+      price: "0.01",
+      currency: "USDC",
+      unlock_policy: "pay_to_reveal",
+      expires_at: "2020-01-01T00:00:00.000Z",
+      public_payload: { summary: "expired" },
+      private_payload: { note: "stale" },
+    });
+    const expiredBuy = await app.fetch(new Request("http://test/api/purchases", {
+      method: "POST", headers: authHeaders(tB), body: JSON.stringify({ signal_id: expired.signal_id }),
+    }));
+    expect(expiredBuy.status).toBe(400);
+    expect((await expiredBuy.json() as any).error).toBe("signal_expired");
+
+    const unsupported = await createSignal({
+      locked: true,
+      price: "0.01",
+      currency: "USDC",
+      unlock_policy: "friends_only",
+      public_payload: { summary: "unsupported" },
+      private_payload: { note: "unsupported" },
+    });
+    const unsupportedBuy = await app.fetch(new Request("http://test/api/purchases", {
+      method: "POST", headers: authHeaders(tB), body: JSON.stringify({ signal_id: unsupported.signal_id }),
+    }));
+    expect(unsupportedBuy.status).toBe(400);
+    expect((await unsupportedBuy.json() as any).error).toBe("unsupported_unlock_policy");
+
+    const malformed = await createSignal({
+      locked: true,
+      currency: "USDC",
+      unlock_policy: "pay_to_reveal",
+      public_payload: { summary: "missing price" },
+      private_payload: { note: "missing price" },
+    });
+    const malformedBuy = await app.fetch(new Request("http://test/api/purchases", {
+      method: "POST", headers: authHeaders(tB), body: JSON.stringify({ signal_id: malformed.signal_id }),
+    }));
+    expect(malformedBuy.status).toBe(400);
+    expect((await malformedBuy.json() as any).error).toBe("invalid_paid_signal");
+
+    const [purchaseCount] = await sqlMod.sql<{ c: number }[]>`
+      SELECT count(*)::int AS c FROM purchases
+    `;
+    expect(purchaseCount?.c).toBe(0);
   });
 
   // ── Billing surface (transparency endpoints) ────────────────────────

@@ -15,6 +15,7 @@ import { billingRoutes } from "./routes/billing.ts";
 import { friendRoutes } from "./routes/friends.ts";
 import { clientErrorRoutes } from "./routes/client_errors.ts";
 import { adminRoutes } from "./routes/admin.ts";
+import { purchaseRoutes } from "./routes/purchases.ts";
 import { validateSolanaConfig } from "./lib/solana.ts";
 
 // R3: validate Solana cluster/RPC/mint at startup. Mismatches silently lose
@@ -84,6 +85,7 @@ app.use("/api/friends/add", bodyLimit({ maxSize: DEFAULT_BODY_MAX, onError: onTo
 app.use("/api/friends/accept", bodyLimit({ maxSize: DEFAULT_BODY_MAX, onError: onTooLarge }));
 app.use("/api/friends/remove", bodyLimit({ maxSize: DEFAULT_BODY_MAX, onError: onTooLarge }));
 app.use("/api/identity/register", bodyLimit({ maxSize: DEFAULT_BODY_MAX, onError: onTooLarge }));
+app.use("/api/purchases", bodyLimit({ maxSize: DEFAULT_BODY_MAX, onError: onTooLarge }));
 app.use("/api/billing/approve-tx", bodyLimit({ maxSize: DEFAULT_BODY_MAX, onError: onTooLarge }));
 app.use("/api/admin/usernames", bodyLimit({ maxSize: DEFAULT_BODY_MAX, onError: onTooLarge }));
 app.use("/api/admin/usernames/:username/grant", bodyLimit({ maxSize: DEFAULT_BODY_MAX, onError: onTooLarge }));
@@ -126,6 +128,7 @@ const drainBody: MiddlewareHandler = async (c, next) => {
 // bodyLimit wraps the stream first, drainBody forces the read, route sees buffered.
 app.use("/api/channels/:id/signals", drainBody);
 app.use("/api/signals/:id/reactions", drainBody);
+app.use("/api/purchases", drainBody);
 
 // BETA-1.b: kick off the rate limiter's bucket GC so memory doesn't grow
 // unbounded. Buckets older than 5 min are pruned every 5 min.
@@ -217,6 +220,7 @@ api.route("/", identityRoutes);
 api.route("/", friendRoutes);
 api.route("/", channelRoutes);
 api.route("/", signalRoutes);
+api.route("/", purchaseRoutes);
 api.route("/", billingRoutes);
 api.route("/", clientErrorRoutes);
 // Admin routes registered BEFORE the catch-all so /api/admin/* doesn't 404.
@@ -236,6 +240,7 @@ const POST_ONLY_API_PATTERNS: RegExp[] = [
   /^\/friends\/(add|accept|remove)$/,
   /^\/channels$/,
   /^\/channels\/[^/]+\/(invite|leave|kick|transfer-owner|signals)$/,
+  /^\/purchases$/,
   /^\/signals\/[^/]+\/reactions$/,
   /^\/billing\/approve-tx$/,
   /^\/client-errors$/,
@@ -267,6 +272,7 @@ api.get("/openapi.json", (c) => {
       "/friends/remove": { post: { summary: "Remove friend", description: "Unfriend and cascade-delete the shared channel and signals", tags: ["Friends"] } },
       "/channels": { post: { summary: "Create group channel", description: "Create a group channel (2-10 members)", tags: ["Channels"] } },
       "/channels/{id}/signals": { post: { summary: "Push signal", description: "Push a trading signal (free-form JSON payload) to a channel", tags: ["Signals"] } },
+      "/purchases": { post: { summary: "Mock-buy a locked paid signal", description: "Creates or returns a mock purchase record for a pay_to_reveal signal. Does not unlock private payload yet.", tags: ["Purchases"] } },
       "/signals/{id}/reactions": { post: { summary: "React to signal", description: "React +1/-1 with size_factor and note", tags: ["Signals"] } },
       "/signals/feed": { get: { summary: "Cross-channel feed", description: "Paginated feed of signals across all channels", tags: ["Signals"] } },
       "/events/stream": { get: { summary: "SSE event stream", description: "Real-time Server-Sent Events stream for all subscribed channels", tags: ["Events"] } },
