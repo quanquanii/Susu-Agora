@@ -1193,6 +1193,11 @@ interface FeedRow {
   peer?: { address: string; username: string | null } | null;
 }
 
+type PaidSignalRender = {
+  plain: string;
+  bubble: string;
+};
+
 function channelLabel(row: FeedRow, myAddress: string): string {
   if (row.channel_name) return row.channel_name;
   if (row.peer?.username) return `@${row.peer.username}`;
@@ -1263,6 +1268,79 @@ function padEndDisplay(s: string, width: number): string {
   const w = displayWidth(s);
   if (w >= width) return s;
   return s + " ".repeat(width - w);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function asNonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function asDisplayValue(value: unknown): string | null {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return null;
+}
+
+function renderPaidSignalPayload(payload: unknown, fromMe: boolean): PaidSignalRender | null {
+  if (!isRecord(payload) || payload.locked !== true) return null;
+
+  const publicPayload = isRecord(payload.public_payload) ? payload.public_payload : {};
+  const privatePayload = isRecord(payload.private_payload) ? payload.private_payload : null;
+
+  const price = asDisplayValue(payload.price);
+  const currency = asNonEmptyString(payload.currency);
+  const summary = asNonEmptyString(publicPayload.summary);
+  const token = asNonEmptyString(publicPayload.token);
+  const direction = asNonEmptyString(publicPayload.direction);
+  const visibilityTag = privatePayload ? (fromMe ? "[AUTHOR]" : "[UNLOCKED]") : null;
+
+  const privateDetails: Array<[string, string]> = [];
+  if (privatePayload) {
+    const entryPrice = asDisplayValue(privatePayload.entry_price);
+    const stopLoss = asDisplayValue(privatePayload.stop_loss);
+    const takeProfit = asDisplayValue(privatePayload.take_profit);
+    const leverage = asDisplayValue(privatePayload.leverage);
+    const reason = asNonEmptyString(privatePayload.reason);
+    if (entryPrice) privateDetails.push(["entry_price", entryPrice]);
+    if (stopLoss) privateDetails.push(["stop_loss", stopLoss]);
+    if (takeProfit) privateDetails.push(["take_profit", takeProfit]);
+    if (leverage) privateDetails.push(["leverage", leverage]);
+    if (reason) privateDetails.push(["reason", reason]);
+  }
+
+  const headerParts = ["[LOCKED]"];
+  if (price && currency) headerParts.push(`${price} ${currency}`);
+
+  const plainParts = [headerParts.join(" ")];
+  const bubbleLines = [headerParts.join(" ")];
+
+  if (summary) {
+    plainParts.push(summary);
+    bubbleLines.push(summary);
+  }
+  if (token || direction) {
+    const tokenDir = [token, direction].filter(Boolean).join(" ");
+    if (tokenDir) {
+      plainParts.push(tokenDir);
+      bubbleLines.push(tokenDir);
+    }
+  }
+  if (visibilityTag) {
+    plainParts.push(visibilityTag);
+    bubbleLines.push(visibilityTag);
+  }
+  for (const [label, value] of privateDetails) {
+    plainParts.push(`${label}=${value}`);
+    bubbleLines.push(`${label}: ${value}`);
+  }
+
+  return {
+    plain: plainParts.join(" | "),
+    bubble: bubbleLines.join("\n"),
+  };
 }
 
 /** Greedy wrap on display-width (CJK-aware), preserving existing newlines. */
@@ -1391,7 +1469,8 @@ function renderPlainLine(row: FeedRow, myAddress: string, myUsername: string | n
   const to = recipientLabel(row, myAddress, myUsername);
   const isHuman = row.payload && typeof row.payload === "object" && row.payload.from_human === true;
   const tag = isHuman ? (process.stdout.isTTY ? `\x1b[1;33m[HUMAN]\x1b[0m ` : `[HUMAN] `) : "";
-  return `${dim(fmtTimePlain(row.created_at))}  ${tag}${padEndDisplay(who, 18)} → ${padEndDisplay(to, 18)}  ${renderPayloadCompact(row.payload)}`;
+  const paid = renderPaidSignalPayload(row.payload, row.from_address === myAddress);
+  return `${dim(fmtTimePlain(row.created_at))}  ${tag}${padEndDisplay(who, 18)} → ${padEndDisplay(to, 18)}  ${paid ? paid.plain : renderPayloadCompact(row.payload)}`;
 }
 
 function renderBubble(row: FeedRow, myAddress: string, myUsername: string | null, termWidth: number): string {
@@ -1404,7 +1483,8 @@ function renderBubble(row: FeedRow, myAddress: string, myUsername: string | null
   const color = !process.stdout.isTTY ? "" : (fromMe ? GREEN : colorFor(who));
   const dot = process.stdout.isTTY ? `${color}●${RESET}` : "●";
 
-  const text = renderPayloadCompact(row.payload);
+  const paid = renderPaidSignalPayload(row.payload, fromMe);
+  const text = paid ? paid.bubble : renderPayloadCompact(row.payload);
   // Bubble takes ~60% of terminal width; floor at 20 cols so very narrow
   // terminals still get a usable shape.
   const maxBubbleInner = Math.max(16, Math.floor(termWidth * 0.6) - 4);
