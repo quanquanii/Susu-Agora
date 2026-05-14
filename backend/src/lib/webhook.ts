@@ -1,5 +1,6 @@
 import { createHmac, randomBytes } from "node:crypto";
 import { sql } from "../db.ts";
+import { clipSignalEventForViewer } from "./paid_signals.ts";
 
 export function generateWebhookSecret(): string {
   return randomBytes(32).toString("hex");
@@ -20,7 +21,13 @@ export async function deliverWebhook(
   if (!rows.length) return;
   const { webhook_url, webhook_secret } = rows[0]!;
 
-  const body = JSON.stringify(event);
+  // Webhook delivery is also an API egress path; paid signals must be clipped
+  // with the same viewer-specific rule as feed/SSE responses.
+  const clippedEvent =
+    event.kind === "signal" && typeof event.from_address === "string"
+      ? clipSignalEventForViewer(event as any, address)
+      : event;
+  const body = JSON.stringify(clippedEvent);
   const signature = signPayload(webhook_secret, body);
 
   fetch(webhook_url, {
@@ -28,7 +35,7 @@ export async function deliverWebhook(
     headers: {
       "Content-Type": "application/json",
       "X-Susu-Signature": signature,
-      "X-Susu-Event": String(event.kind ?? "unknown"),
+      "X-Susu-Event": String(clippedEvent.kind ?? "unknown"),
     },
     body,
     signal: AbortSignal.timeout(10_000),
@@ -42,22 +49,27 @@ export async function deliverToChannelMembers(
   senderAddress: string,
   event: Record<string, unknown>,
 ): Promise<void> {
-  const members = await sql<{ webhook_url: string; webhook_secret: string }[]>`
-    SELECT i.webhook_url, i.webhook_secret FROM channel_members cm
+  const members = await sql<{ address: string; webhook_url: string; webhook_secret: string }[]>`
+    SELECT cm.address, i.webhook_url, i.webhook_secret FROM channel_members cm
     JOIN identities i ON i.address = cm.address
     WHERE cm.channel_id = ${channelId}
       AND cm.address != ${senderAddress}
       AND i.webhook_url IS NOT NULL
   `;
-  const body = JSON.stringify(event);
   for (const m of members) {
+    // Each recipient gets a payload clipped for that recipient's address.
+    const clippedEvent =
+      event.kind === "signal" && typeof event.from_address === "string"
+        ? clipSignalEventForViewer(event as any, m.address)
+        : event;
+    const body = JSON.stringify(clippedEvent);
     const signature = signPayload(m.webhook_secret, body);
     fetch(m.webhook_url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "X-Susu-Signature": signature,
-        "X-Susu-Event": String(event.kind ?? "unknown"),
+        "X-Susu-Event": String(clippedEvent.kind ?? "unknown"),
       },
       body,
       signal: AbortSignal.timeout(10_000),

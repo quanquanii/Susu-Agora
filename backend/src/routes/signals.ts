@@ -1,6 +1,9 @@
 // Signal + Reaction routes.
 //
 // D4: protocol does not validate payload shape — accept any JSON.
+// Step 1 paid signals add a conventional envelope inside that JSON:
+// {locked, price, currency, unlock_policy, expires_at, public_payload, private_payload}.
+// Storage keeps the whole object; read paths clip private_payload for non-authors.
 // D5: every push (signal or reaction) writes one usage_log row (atomic).
 // D3: no hit-rate / leaderboard; this module only stores + relays.
 //
@@ -19,6 +22,7 @@ import { check as rateCheck, RateLimitedError } from "../lib/rate_limit.ts";
 import { recordEvent } from "../lib/events.ts";
 import { buildAllowanceResponse } from "./billing.ts";
 import { deliverToChannelMembers } from "../lib/webhook.ts";
+import { clipSignalEventForViewer, clipSignalPayloadForViewer } from "../lib/paid_signals.ts";
 import { stripControlCharsDeep } from "../../../shared/strip-control.ts";
 
 const APPROVE_AGAIN_URL = "https://susurration.xyz/approve?amount=100";
@@ -38,7 +42,7 @@ function insufficientAllowance(c: any, e: InsufficientAllowanceError) {
 // response 200 × 64KB = 12.8MB — bad for terminal renderers, mobile, slow
 // links. Truncate per-row payload at PAYLOAD_RENDER_CAP and replace with
 // {truncated:true, size_bytes:N, preview} so the client can decide whether
-// to fetch the full thing via /channels/.../signals?since=... .
+// to fetch the full author/member-visible row via /channels/.../signals?since=... .
 // Storage is unaffected — we still keep the original. (G v0.0.4 review 🟡 #3)
 const PAYLOAD_RENDER_CAP = 4096;
 function truncatePayloadForFeed(p: unknown): unknown {
@@ -386,6 +390,8 @@ function authError(c: any, e: unknown) {
 }
 
 // POST /channels/:id/signals — push a signal. payload is any JSON.
+// For paid signals we still persist the full payload; clipping happens only
+// on outbound read paths after membership / viewer identity is known.
 signalRoutes.post("/channels/:id/signals", async (c) => {
   let me: string;
   try { me = await withAuth(c); } catch (e) { return authError(c, e); }
@@ -478,7 +484,8 @@ signalRoutes.post("/channels/:id/signals", async (c) => {
   }
 });
 
-// GET /channels/:id/signals?since=ISO&limit=N — fetch signal log
+// GET /channels/:id/signals?since=ISO&limit=N — fetch signal log.
+// Paid-signal rule: non-authors do NOT receive private_payload here.
 signalRoutes.get("/channels/:id/signals", async (c) => {
   let me: string;
   try { me = await withAuth(c); } catch (e) { return authError(c, e); }
@@ -514,6 +521,9 @@ signalRoutes.get("/channels/:id/signals", async (c) => {
         WHERE s.channel_id = ${channelId}
         ORDER BY s.created_at DESC LIMIT ${limit}
       `;
+  for (const row of rows) {
+    row.payload = clipSignalPayloadForViewer(row.payload, me, row.from_address);
+  }
   return c.json({ signals: rows });
 });
 
@@ -574,7 +584,8 @@ signalRoutes.get("/channels/:id/signals/stream", async (c) => {
         wakeWaiter();
         return;
       }
-      queue.push(evt as Event);
+      const event = evt as Event;
+      queue.push(event.kind === "signal" ? clipSignalEventForViewer(event, me) : event);
       wakeWaiter();
     });
 
@@ -650,6 +661,7 @@ signalRoutes.get("/channels/:id/signals/stream", async (c) => {
 // Response: { events: [...], signals: [...] }
 // `events` = unified timeline (signals + reactions interleaved by time).
 // `signals` = same as `events` (backward-compat alias — older CLIs read this).
+// Paid-signal rule: signal rows are clipped per viewer before truncation.
 signalRoutes.get("/signals/feed", async (c) => {
   let me: string;
   try { me = await withAuth(c); } catch (e) { return authError(c, e); }
@@ -742,8 +754,13 @@ signalRoutes.get("/signals/feed", async (c) => {
   `;
   // S5: cap each row's payload so feed bootstrap stays bounded even if
   // a malicious peer pushed 64KB messages. Original stays in DB; clients
-  // wanting the full row can fetch via /channels/{id}/signals.
-  for (const r of rows) r.payload = truncatePayloadForFeed(r.payload);
+  // wanting the full viewer-visible row can fetch via /channels/{id}/signals.
+  for (const r of rows) {
+    const payload = r.kind === "signal"
+      ? clipSignalPayloadForViewer(r.payload, me, r.from_address)
+      : r.payload;
+    r.payload = truncatePayloadForFeed(payload);
+  }
   // `events` is the canonical key; `signals` kept for backward compat.
   return c.json({ events: rows, signals: rows });
 });
@@ -842,10 +859,13 @@ signalRoutes.get("/signals/feed/stream", async (c) => {
         }
         const e = evt as Event;
         // Cap payload only for SignalEvent (other events have small fixed
-        // shapes — no need to truncate). Merge channel meta for client
-        // rendering consistency.
+        // shapes — no need to truncate). Paid signals are clipped first so
+        // feed SSE never leaks private_payload to non-authors. Merge channel
+        // meta for client rendering consistency.
         const payload = e.kind === "signal"
-          ? truncatePayloadForFeed((e as SignalEvent).payload)
+          ? truncatePayloadForFeed(
+              clipSignalPayloadForViewer((e as SignalEvent).payload, me, (e as SignalEvent).from_address),
+            )
           : "payload" in e ? e.payload : undefined;
         queue.push({ ...e, ...(payload !== undefined ? { payload } : {}), ...meta });
         wakeWaiter();

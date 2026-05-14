@@ -640,6 +640,84 @@ describeE2E("Susurration E2E (D7+D13)", () => {
     }
   });
 
+  test("paid signal payloads store private data but clip it for non-authors in channel log and feed", async () => {
+    const wA = makeWallet(); const tA = await login(wA);
+    const wB = makeWallet(); const tB = await login(wB);
+    await register(tA, uname("pa"));
+    const bU = uname("pb"); await register(tB, bU);
+    await sqlMod.sql`UPDATE identities SET auto_accept_friends = true WHERE address = ${wB.address}`;
+    const add = await app.fetch(new Request("http://test/api/friends/add", {
+      method: "POST", headers: authHeaders(tA), body: JSON.stringify({ username: bU }),
+    }));
+    const { channel_id } = await add.json() as any;
+
+    const lockedPayload = {
+      locked: true,
+      price: "25",
+      currency: "USD",
+      unlock_policy: "pay_to_reveal",
+      expires_at: "2026-12-31T00:00:00.000Z",
+      public_payload: { teaser: "BTC scalp setup" },
+      private_payload: { entry: "65000", stop: "64000", note: "private edge" },
+    };
+
+    const push = await app.fetch(new Request(`http://test/api/channels/${channel_id}/signals`, {
+      method: "POST", headers: authHeaders(tA), body: JSON.stringify(lockedPayload),
+    }));
+    if (!requireRate(0)) {
+      expect(push.status).toBe(402);
+      return;
+    }
+
+    expect(push.status).toBe(201);
+    const pushed = await push.json() as any;
+    expect(pushed.payload.private_payload.note).toBe("private edge");
+
+    const authorChannelSignals = await app.fetch(new Request(`http://test/api/channels/${channel_id}/signals`, {
+      headers: authHeaders(tA),
+    }));
+    expect(authorChannelSignals.status).toBe(200);
+    const authorChannelBody = await authorChannelSignals.json() as any;
+    expect(authorChannelBody.signals[0].payload.private_payload.note).toBe("private edge");
+
+    const viewerChannelSignals = await app.fetch(new Request(`http://test/api/channels/${channel_id}/signals`, {
+      headers: authHeaders(tB),
+    }));
+    expect(viewerChannelSignals.status).toBe(200);
+    const viewerChannelBody = await viewerChannelSignals.json() as any;
+    expect(viewerChannelBody.signals[0].payload).toEqual({
+      locked: true,
+      price: "25",
+      currency: "USD",
+      unlock_policy: "pay_to_reveal",
+      expires_at: "2026-12-31T00:00:00.000Z",
+      public_payload: { teaser: "BTC scalp setup" },
+    });
+    expect(viewerChannelBody.signals[0].payload.private_payload).toBeUndefined();
+
+    const authorFeed = await app.fetch(new Request("http://test/api/signals/feed", {
+      headers: authHeaders(tA),
+    }));
+    expect(authorFeed.status).toBe(200);
+    const authorFeedBody = await authorFeed.json() as any;
+    expect(authorFeedBody.events[0].payload.private_payload.note).toBe("private edge");
+
+    const viewerFeed = await app.fetch(new Request("http://test/api/signals/feed", {
+      headers: authHeaders(tB),
+    }));
+    expect(viewerFeed.status).toBe(200);
+    const viewerFeedBody = await viewerFeed.json() as any;
+    expect(viewerFeedBody.events[0].payload).toEqual({
+      locked: true,
+      price: "25",
+      currency: "USD",
+      unlock_policy: "pay_to_reveal",
+      expires_at: "2026-12-31T00:00:00.000Z",
+      public_payload: { teaser: "BTC scalp setup" },
+    });
+    expect(viewerFeedBody.events[0].payload.private_payload).toBeUndefined();
+  });
+
   // ── Billing surface (transparency endpoints) ────────────────────────
 
   test("billing: /allowance returns BETA shape when rate=0, paid shape when rate=1", async () => {
