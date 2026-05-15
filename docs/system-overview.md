@@ -90,7 +90,25 @@ susu push @friend -j '{"token":"BTCUSDT","direction":"long","metadata":{"entry_p
 
 # 推送纯文本
 susu push @friend -m "ETH looks good for a long here"
-susu buy <signal_id>     # Step 3 mock buy（仅记录 purchase，不解锁）
+
+# 推送 locked paid signal（private_payload 仅作者/买家可见）
+susu push @friend -j '{
+  "type": "trade_entry",
+  "locked": true,
+  "price": "0.01",
+  "currency": "USDC",
+  "unlock_policy": "pay_to_reveal",
+  "expires_at": "2026-12-31T00:00:00.000Z",
+  "public_payload": {"token": "BTCUSDT", "direction": "long", "summary": "BTC breakout retest"},
+  "private_payload": {"entry_price": 65000, "stop_loss": 63500, "take_profit": 69500}
+}'
+```
+
+### 购买并解锁 paid signal
+
+```bash
+susu buy <signal_id>     # 创建 mock purchase 记录，解锁 private_payload
+susu reputation @alice   # 查询卖家 reputation
 ```
 
 ### 查看事件
@@ -128,9 +146,9 @@ susu-agent-daemon  # 或手动启动
 配置文件：`~/.susu/agent-config.json`
 
 关键字段：
-- `llm.provider`：`"openai"` 或 `"anthropic"`
-- `llm.api_key`：用户自己的 API key（费用由用户承担，约 $0.01-0.03/次调用）
-- `llm.model`：例如 `"gpt-4o"`、`"claude-sonnet-4-20250514"`
+- `llm.provider`：`"openai"`、`"anthropic"` 或 `"groq"`
+- `llm.api_key`：用户自己的 API key（Groq 推荐用 `GROQ_API_KEY` 环境变量，留 `api_key` 为空）
+- `llm.model`：例如 `"gpt-4o"`、`"claude-sonnet-4-6"`、`"openai/gpt-oss-20b"`（Groq）
 - `agent.max_calls_per_minute`：安全上限（默认：10）
 - `agent.system_prompt`：定义交易人格与决策规则
 - `dry_run_pushes`：true = daemon 可 react 但不能 push 新信号（安全默认）
@@ -207,46 +225,97 @@ susu feed -f           # 实时信息流，底部带常驻仓位栏
 - `metadata.entry_price`：模拟交易必填
 - `metadata.stop_loss`、`take_profit`、`leverage`：推荐提供
 
-### Paid Signal（Step 1 payload 约定）
+### Paid Signal / Pay-to-Reveal MVP
+
+Sellers push **locked** signals using the following payload envelope:
 
 ```json
 {
+  "type": "trade_entry",
   "locked": true,
-  "price": "25",
-  "currency": "USD",
+  "price": "0.01",
+  "currency": "USDC",
   "unlock_policy": "pay_to_reveal",
   "expires_at": "2026-12-31T00:00:00.000Z",
   "public_payload": {
-    "teaser": "BTC scalp setup"
+    "token": "BTCUSDT",
+    "direction": "long",
+    "summary": "BTC breakout retest"
   },
   "private_payload": {
-    "entry": "65000",
-    "stop": "64000",
-    "note": "private edge"
+    "entry_price": 65000,
+    "stop_loss": 63500,
+    "take_profit": 69500,
+    "leverage": 2,
+    "reason": "R:R about 3:1"
   }
 }
 ```
 
-- Step 1 仅定义 payload 结构和默认读侧裁剪规则，不包含购买、解锁或 mock payment。
-- 服务端写入时会保留 `public_payload` 与 `private_payload`。
-- 当 `locked=true` 时，作者读取自己的 signal 会拿到完整 payload；其他成员默认只拿到 `locked` 元数据加 `public_payload`。
+**可见性规则（backend payload 裁剪）：**
 
-### Mock Buy（Step 3）
+| 身份 | 可见内容 |
+|---|---|
+| 作者（signal 发送者）| 完整 payload（含 `private_payload`），标记 `viewer_role: "author"` |
+| 已购买买家（`status="paid"`）| 完整 payload（含 `private_payload`），标记 `viewer_role: "buyer"` |
+| 未购买成员 | 仅 `public_payload` + 价格/policy 元数据，标记 `viewer_role: "locked"` |
 
-Step 3 新增了 mock purchase 记录；Step 4 起，`status="paid"` 的 purchase 会解锁 `pay_to_reveal` 信号的 `private_payload`：
+CLI feed 显示：`[LOCKED]` / `[UNLOCKED]` / `[AUTHOR]`
+
+**购买流程（mock settlement）：**
 
 - CLI 命令：`susu buy <signal_id>`
-- 后端接口：`POST /api/purchases`
-- 存储：Postgres `purchases` 表
-- 当前只做 mock 记账：
-  - `status="paid"`
-  - `tx_hash="mock_tx_*"`
-  - 同一个 `signal_id + buyer_handle` 幂等，重复购买返回已有 purchase
-- Step 4 读侧解锁规则：
-  - 作者永远能看到完整 payload
-  - `status="paid"` 的买家能看到完整 payload
-  - `pending` / `failed` / `refunded` 不解锁
-  - 未购买成员仍然只看到 `public_payload`
+- 后端接口：`POST /api/purchases`，请求体 `{"signal_id": "<uuid>"}`
+- 存储：Postgres `purchases` 表（migration `013_purchases.sql`）
+- 当前为本地 mock 记账，**不是**真实链上 USDC 支付：
+  - `status = "paid"`
+  - `tx_hash = "mock_tx_*"`
+  - 同一 `signal_id + buyer_handle` 幂等，重复购买返回已有 purchase
+  - 不能购买自己的 signal
+  - 过期 signal 拒绝购买
+- 已购买后再查看 feed，`private_payload` 即解锁可见
+- **真实 USDC / Circle / Arc settlement 是后续工作，尚未实现**
+
+**`POST /api/purchases` 响应字段：**
+
+```json
+{
+  "id": "<uuid>",
+  "signal_id": "<uuid>",
+  "buyer_handle": "@bob001",
+  "seller_handle": "@alice001",
+  "amount": "0.01",
+  "currency": "USDC",
+  "status": "paid",
+  "tx_hash": "mock_tx_...",
+  "created_at": "2026-05-14T...",
+  "already_purchased": false
+}
+```
+
+### Seller Reputation v1
+
+基于 `purchases` 和 `signals` 聚合的公开统计，不需要 auth：
+
+```bash
+susu reputation @alice001          # 人类可读格式
+susu reputation @alice001 --json   # JSON 格式
+```
+
+后端接口：`GET /api/profiles/:handle/reputation`
+
+响应字段：
+
+| 字段 | 说明 |
+|---|---|
+| `signals_published` | 该 handle 发布的 signal 总数 |
+| `signals_sold` | status='paid' 的 distinct signal 数 |
+| `total_revenue` | status='paid' 的 amount 总和（TEXT，如 "0.02"）|
+| `currency` | 结算货币（如 "USDC"）|
+| `unique_buyers` | distinct buyer_handle 数 |
+| `repeat_buyers` | 购买过 >=2 个不同 signal 的 buyer 数 |
+
+**Reputation v1 不计算 PnL、hit rate 或字母评级。reactions 不参与 reputation 计算。**
 
 ### 自动归一化
 
@@ -382,6 +451,8 @@ susu friends remove @someone
 | `susu friends remove @friend` | 解除好友并删除频道 |
 | `susu push @friend -j '{...}'` | 推送 JSON 信号 |
 | `susu push @friend -m "text"` | 推送纯文本 |
+| `susu buy <signal_id>` | 购买 locked paid signal（mock settlement）|
+| `susu reputation <@handle>` | 查询卖家 reputation（公开，无需 auth）|
 | `susu watch` | 实时事件流 |
 | `susu feed` | 跨频道信息流 |
 | `susu book` | 模拟交易仓位 |
@@ -422,9 +493,10 @@ A：免费额度已用尽。执行 `susu allowance` 检查余额，并通过 USD
 **Q: Daemon 不对信号做反应**
 A：请依次检查：
 1. daemon 是否在运行（`ps aux | grep susu-agent-daemon`）
-2. LLM API key 是否有效
+2. LLM API key 是否有效（Groq 推荐用 `GROQ_API_KEY` 环境变量）
 3. 好友连接是否已建立
 4. 查看决策日志 `~/.susu/agent-decisions.jsonl` 是否报错
+5. 如果信号是 locked paid signal 且未购买，daemon 会跳过（不调用 LLM），日志会显示 `skipped locked signal`。运行 `susu buy <signal_id>` 购买后，daemon 会对已解锁信号正常进入 LLM decision flow
 
 **Q: 模拟交易没有开仓**
 A：信号必须包含 `token`、`direction` 和 `metadata.entry_price`。daemon 还需要给出 +1 且 size_factor >= 0.5。可用 `susu book` 查看仓位。
@@ -442,3 +514,130 @@ A：每个账户一个 daemon。该 daemon 会处理该身份下的所有频道�
 
 **Q: 如何更新？**
 A：执行 `npm update -g susurration`（CLI）和 `npm update -g susurration-agent-daemon`（daemon），然后重启 daemon。
+
+---
+
+## 本地演示：完整 Paid Signal 流程
+
+以下步骤使用两个本地身份（Alice / Bob）演示 pay-to-reveal 完整流程。
+
+```bash
+# 1. 启动 Postgres
+docker compose up -d postgres
+
+# 2. 运行迁移（含 013_purchases）
+cd backend && bun run migrate
+
+# 3. 启动 backend
+bun run dev        # 监听 http://localhost:8787
+
+# 4. Build CLI（另开终端）
+cd cli && bun run build
+
+# 5. 确认 Alice/Bob 已注册并互为 friends
+#    （假设已通过 susu join / susu add / susu accept 完成）
+
+# 6. Alice 推送 locked paid signal
+SUSU_API_URL=http://localhost:8787/api \
+SUSU_HOME=/tmp/susu-alice \
+node cli/bin/susu.mjs push @bob001 -j '{
+  "type": "trade_entry",
+  "locked": true,
+  "price": "0.01",
+  "currency": "USDC",
+  "unlock_policy": "pay_to_reveal",
+  "expires_at": "2030-01-01T00:00:00.000Z",
+  "public_payload": {
+    "token": "BTCUSDT",
+    "direction": "long",
+    "summary": "BTC breakout retest"
+  },
+  "private_payload": {
+    "entry_price": 65000,
+    "stop_loss": 63500,
+    "take_profit": 69500,
+    "leverage": 2,
+    "reason": "R:R about 3:1"
+  }
+}'
+# 记录返回的 signal_id
+
+# 7. Bob 查看 feed（购买前）
+SUSU_API_URL=http://localhost:8787/api \
+SUSU_HOME=/tmp/susu-bob \
+node cli/bin/susu.mjs feed --snapshot
+# 期望：[LOCKED] 标记，能看到 summary，看不到 entry_price/stop_loss 等
+
+# 8. Bob 购买 signal
+SUSU_API_URL=http://localhost:8787/api \
+SUSU_HOME=/tmp/susu-bob \
+node cli/bin/susu.mjs buy <signal_id>
+# 期望：返回 status=paid, tx_hash=mock_tx_*
+
+# 9. Bob 查看 feed（购买后）
+SUSU_API_URL=http://localhost:8787/api \
+SUSU_HOME=/tmp/susu-bob \
+node cli/bin/susu.mjs feed --snapshot
+# 期望：[UNLOCKED] 标记，能看到 entry_price、stop_loss、take_profit 等
+
+# 10. Alice 查看 feed
+SUSU_API_URL=http://localhost:8787/api \
+SUSU_HOME=/tmp/susu-alice \
+node cli/bin/susu.mjs feed --snapshot
+# 期望：[AUTHOR] 标记，始终能看到完整 private_payload
+
+# 11. Bob daemon 遇到未购买的 locked signal 会 skip
+#     日志：skipped locked signal <id> price=0.01 USDC
+#     daemon 不会调用 LLM，直接标记 processed
+
+# 12. Bob daemon 遇到已购买的 locked signal 会正常进入 LLM decision flow
+
+# 13. 查询 Alice reputation
+SUSU_API_URL=http://localhost:8787/api \
+SUSU_HOME=/tmp/susu-bob \
+node cli/bin/susu.mjs reputation @alice001
+# 期望输出：
+#   handle:            @alice001
+#   signals_published: >= 1
+#   signals_sold:      >= 1
+#   total_revenue:     0.01 USDC
+#   unique_buyers:     1
+#   repeat_buyers:     0
+```
+
+---
+
+## 验证命令
+
+```bash
+# backend e2e
+cd backend
+bun run migrate
+SUSU_E2E=1 bun test tests/e2e.test.ts -t "mock buy"
+SUSU_E2E=1 bun test tests/e2e.test.ts -t "pay-to-reveal"
+SUSU_E2E=1 bun test tests/e2e.test.ts -t "reputation"
+
+# agent-daemon
+bunx tsc --noEmit -p agent-daemon/tsconfig.json
+cd agent-daemon && bun test
+
+# CLI
+bunx tsc --noEmit -p cli/tsconfig.json
+cd cli && bun run build
+```
+
+---
+
+## Known Limitations / Future Work
+
+以下功能**尚未实现**，当前版本中不存在：
+
+- **真实 USDC settlement**：购买流程是本地 mock，`tx_hash = mock_tx_*`，不涉及链上转账
+- **Circle / Arc settlement**：未接入任何真实支付网关
+- **钱包绑定**：buyer / seller 没有 on-chain 钱包地址绑定到 purchases 记录
+- **退款工作流**：`purchases.status` schema 支持 `refunded`，但没有退款 API 或流程
+- **Reputation v2（PnL / hit rate）**：Reputation v1 只统计购买量，不计算 trading 表现
+- **字母评级**：未实现 A/B/C 评级系统
+- **Agent 自动购买**：daemon 遇到 locked signal 会 skip，不会自动 buy
+- **Price oracle / 市场价结算**：无价格 feed 接入
+- **Web dashboard paid signal 流程**：Web UI 是否支持 buy/reputation 流程取决于前端代码，CLI 是确定可用的入口

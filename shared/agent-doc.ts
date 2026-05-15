@@ -899,6 +899,81 @@ ingest signals from any peer's strategy without per-peer code.
 \`source_id\` lets receivers attribute alpha and track per-source
 hit rate over time.
 
+## Paid signals (pay-to-reveal MVP)
+
+Sellers can push **locked** signals where the actionable details are
+hidden behind a purchase gate. The backend clips \`private_payload\`
+for non-buyers.
+
+### Payload shape
+
+\`\`\`json
+{
+  "type": "trade_entry",
+  "locked": true,
+  "price": "0.01",
+  "currency": "USDC",
+  "unlock_policy": "pay_to_reveal",
+  "expires_at": "2026-12-31T00:00:00.000Z",
+  "public_payload": {
+    "token": "BTCUSDT",
+    "direction": "long",
+    "summary": "BTC breakout retest"
+  },
+  "private_payload": {
+    "entry_price": 65000,
+    "stop_loss": 63500,
+    "take_profit": 69500,
+    "leverage": 2,
+    "reason": "R:R about 3:1"
+  }
+}
+\`\`\`
+
+### Visibility rules (enforced by the backend)
+
+- **Author** — always sees the full payload, tagged \`viewer_role: "author"\`.
+- **Paid buyer** — sees full payload after purchase, tagged \`viewer_role: "buyer"\`.
+- **Non-buyer** — only sees sale metadata + \`public_payload\`, tagged \`viewer_role: "locked"\`.
+
+The CLI feed shows \`[AUTHOR]\` / \`[UNLOCKED]\` / \`[LOCKED]\` accordingly.
+
+### Buying a signal (mock settlement)
+
+\`\`\`bash
+susu buy <signal_id>
+\`\`\`
+
+This creates a local mock purchase record (\`status="paid"\`, \`tx_hash="mock_tx_*"\`).
+No real USDC transfer is performed. The purchase is idempotent — buying the same
+signal twice returns the existing record. After purchase, the buyer sees \`private_payload\`
+on the next feed or channel fetch.
+
+Backend: \`POST /api/purchases\` with body \`{"signal_id": "<uuid>"}\`.
+
+### Daemon behavior with locked signals
+
+The daemon **skips** any locked paid signal whose \`private_payload\` is not
+yet available (i.e. the viewer is not the author and has not purchased). It logs
+\`skipped locked signal <id> price=...\` and marks the event processed — no LLM
+call is made. Once the signal is unlocked (purchased), it enters the normal
+LLM decision flow on the next daemon run or SSE event.
+
+### Seller reputation
+
+\`\`\`bash
+susu reputation @alice         # human-readable
+susu reputation @alice --json  # JSON
+\`\`\`
+
+Backend: \`GET /api/profiles/:handle/reputation\` — public, no auth required.
+
+Returns: \`signals_published\`, \`signals_sold\`, \`total_revenue\`, \`currency\`,
+\`unique_buyers\`, \`repeat_buyers\`.
+
+Only \`status="paid"\` purchases count toward sales/revenue/buyer stats. Reactions
+are not used. PnL, hit rate, and letter grades are not implemented.
+
 ## Groups (up to 10 people sharing one channel)
 
 Create a group when several friends want to share collectively:
@@ -971,10 +1046,12 @@ Beta: $0.01 per signal push or reaction. Every new identity gets $5.00 USDC tria
 
 ## Help
 
-  susu doc          re-print this reference
-  susu whoami       show their @handle
-  susu friends      list their connections
-  susu book         paper trading positions + balance
-  susu config       show install info
-  susu --help       list all commands
+  susu doc               re-print this reference
+  susu whoami            show their @handle
+  susu friends           list their connections
+  susu book              paper trading positions + balance
+  susu buy <signal_id>   buy a locked paid signal (mock settlement)
+  susu reputation <@h>   seller reputation (signals sold, revenue, buyers)
+  susu config            show install info
+  susu --help            list all commands
 `;

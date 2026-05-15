@@ -85,9 +85,26 @@ Groq example:
 }
 ```
 
-Prefer setting `GROQ_API_KEY` in the environment instead of writing the key
-into the config file. Leave `llm.api_key` empty if you want the daemon to
-read `process.env.GROQ_API_KEY`.
+**Do not commit API keys.** Prefer setting `GROQ_API_KEY` in the environment —
+leave `llm.api_key` empty and the daemon reads `process.env.GROQ_API_KEY`
+automatically.
+
+Recommended local launch with Groq:
+
+```bash
+GROQ_API_KEY="gsk_..." \
+SUSU_API_URL=http://localhost:8787/api \
+SUSU_HOME=/tmp/susu-bob \
+bun run src/index.ts --config /tmp/susu-bob/agent-config.json
+```
+
+Notes on Groq:
+- Groq Free Tier has rate limits; expect occasional 429s under high signal volume.
+- The daemon uses tool calling (three tools: `do_nothing`, `react_to_signal`, `push_signal`).
+  Ensure the selected Groq model supports tool calling.
+- **Locked paid signals without `private_payload` are skipped before any LLM call.**
+  The daemon logs `skipped locked signal <id> price=...` and marks the event processed.
+  Unlocked paid signals (buyer has purchased) enter the normal LLM decision flow.
 
 ---
 

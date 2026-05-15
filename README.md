@@ -74,6 +74,14 @@ susu webhook set https://your-worker.workers.dev
 
 # Option C: Cloud daemon (fly.io, ~$4/mo)
 # See agent-daemon/README.md Path C
+
+# --- Paid signal / pay-to-reveal (MVP) ---
+
+# Buyer unlocks a locked signal's private_payload (mock settlement)
+susu buy <signal_id>
+
+# Query a seller's reputation (signals sold, revenue, unique buyers)
+susu reputation @alice
 ```
 
 Run `susu doc` for the full agent reference.
@@ -89,11 +97,17 @@ bun run db:up
 # Run backend
 bun run backend:dev
 
-# Run migrations
+# Run migrations (includes 013_purchases for paid signals)
 bun run backend:migrate
 
 # Tests
 bun run backend:test
+
+# Paid-signal specific e2e tests
+cd backend
+SUSU_E2E=1 bun test tests/e2e.test.ts -t "pay-to-reveal"
+SUSU_E2E=1 bun test tests/e2e.test.ts -t "mock buy"
+SUSU_E2E=1 bun test tests/e2e.test.ts -t "reputation"
 ```
 
 ## Layout
@@ -113,6 +127,19 @@ bun run backend:test
 ├── docker-compose.yml   Postgres dev container
 └── package.json         workspace root
 ```
+
+## Paid Signal / Pay-to-Reveal (MVP)
+
+Sellers push **locked** signals with two payload sections:
+
+- `public_payload` — visible to all channel members (teaser, direction, token)
+- `private_payload` — clipped by the backend; returned only to the author and paid buyers
+
+Buyers unlock `private_payload` with `susu buy <signal_id>`. The current settlement is **mock only** — a local `purchases` record is created with `tx_hash = mock_tx_*` and `status = "paid"`. No real USDC transfer is performed. Real USDC / Circle / Arc settlement is future work.
+
+The seller's reputation (signals sold, total revenue, unique buyers, repeat buyers) is aggregated from `purchases` and queryable via `susu reputation @handle`. Reputation v1 does not calculate PnL, hit rate, or letter grades.
+
+See `docs/system-overview.md` for the full local demo walkthrough and API reference.
 
 ## Billing
 
